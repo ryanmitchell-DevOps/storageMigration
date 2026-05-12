@@ -26,7 +26,7 @@ parameters:
 name: storage-migration_$(Date:yyyyMMdd)$(Rev:.r)
 
 pool:
-  name: GEA-FT-Mngt-Pool
+  name: ubuntu-latest
 
 stages:
   - stage: StorageMigration
