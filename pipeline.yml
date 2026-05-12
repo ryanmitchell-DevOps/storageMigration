@@ -26,7 +26,7 @@ parameters:
 name: storage-migration_$(Date:yyyyMMdd)$(Rev:.r)
 
 pool:
-  name: ubuntu-latest
+  vmImage: ubuntu-latest
 
 stages:
   - stage: StorageMigration
