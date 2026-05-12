@@ -33,6 +33,14 @@ function Write-LogDirectory {
     return $dir
 }
 
+function Format-FileSize {
+    param([long]$Bytes)
+    if ($Bytes -ge 1GB) { return '{0:N2} GB' -f ($Bytes / 1GB) }
+    if ($Bytes -ge 1MB) { return '{0:N2} MB' -f ($Bytes / 1MB) }
+    if ($Bytes -ge 1KB) { return '{0:N2} KB' -f ($Bytes / 1KB) }
+    return '{0} B' -f $Bytes
+}
+
 function Set-SubscriptionContext {
     param([string]$SubscriptionId)
     $null = Set-AzContext -SubscriptionId $SubscriptionId -WarningAction SilentlyContinue
@@ -88,10 +96,19 @@ function Show-MigrationStatus {
     $migratedPct = [math]::Round(100 - $pendingPct, 2)
 
     Write-Log $Label
-    Write-Host ('Source blobs: {0}' -f $sourceCount)
+    Write-Host ('Source blobs:      {0}' -f $sourceCount)
     Write-Host ('Destination blobs: {0}' -f $destCount)
-    Write-Host ('Already migrated: {0} ({1}%)' -f ($sourceCount - $pendingCount), $migratedPct)
-    Write-Host ('Pending: {0} ({1}%)' -f $pendingCount, $pendingPct)
+    Write-Host ('Already migrated:  {0} ({1}%)' -f ($sourceCount - $pendingCount), $migratedPct)
+    Write-Host ('Pending:           {0} ({1}%)' -f $pendingCount, $pendingPct)
+    if ($pendingCount -gt 0) {
+        $listLimit = [Math]::Min($pendingCount, 50)
+        Write-Host ''
+        Write-Host '  Pending blobs:'
+        $pending | Sort-Object | Select-Object -First $listLimit | ForEach-Object {
+            Write-Host ('    {0,-60} {1,10}' -f $_, (Format-FileSize $Source[$_].Length))
+        }
+        if ($pendingCount -gt $listLimit) { Write-Host "    ... and $($pendingCount - $listLimit) more" }
+    }
 
     return [pscustomobject]@{
         SourceCount    = $sourceCount
@@ -162,6 +179,30 @@ function Test-MigrationCompleteness {
     }
 }
 
+function Show-BlobComparison {
+    param([hashtable]$Source, [hashtable]$Destination)
+    $fmt = '  {0,-60} {1,12} {2,12}  {3}'
+    Write-Host ($fmt -f 'Blob Name', 'Source', 'Destination', 'Match')
+    Write-Host ($fmt -f ('-' * 60), ('-' * 12), ('-' * 12), '-----')
+    [long]$totalSrc = 0
+    [long]$totalDst = 0
+    foreach ($name in ($Source.Keys | Sort-Object)) {
+        $srcSize = $Source[$name].Length
+        $totalSrc += $srcSize
+        if ($Destination.ContainsKey($name)) {
+            $dstSize = $Destination[$name].Length
+            $totalDst += $dstSize
+            $match = if ($srcSize -eq $dstSize) { 'OK' } else { 'MISMATCH' }
+            Write-Host ($fmt -f $name, (Format-FileSize $srcSize), (Format-FileSize $dstSize), $match)
+        }
+        else {
+            Write-Host ($fmt -f $name, (Format-FileSize $srcSize), 'MISSING', 'MISSING')
+        }
+    }
+    Write-Host ($fmt -f ('-' * 60), ('-' * 12), ('-' * 12), '-----')
+    Write-Host ($fmt -f 'TOTAL', (Format-FileSize $totalSrc), (Format-FileSize $totalDst), '')
+}
+
 # Script
 $logDir = Write-LogDirectory -Log $LogDirectory
 Set-AzCopyEnvironment -LogDirectory $logDir
@@ -206,6 +247,16 @@ if ($PSCmdlet.ShouldProcess(
                       -SourceContainer $SourceContainer `
                       -DestAccount $DestStorageAccount `
                       -DestContainer $DestContainer
+
+    Write-Log 'TRANSFERRED FILES'
+    [long]$transferTotal = 0
+    $preStatus.PendingNames | Sort-Object | ForEach-Object {
+        $size = $sourceInventory[$_].Length
+        $transferTotal += $size
+        Write-Host ('  {0,-60} {1,10}' -f $_, (Format-FileSize $size))
+    }
+    Write-Host ''
+    Write-Host ('  Total: {0} file(s), {1}' -f $preStatus.PendingNames.Count, (Format-FileSize $transferTotal))
 }
 else {
     Write-Warning 'Dry run (-WhatIf) -- no data copied.'
@@ -229,7 +280,14 @@ $validation = Test-MigrationCompleteness -Source $sourceInventory `
 if ($validation.Passed) {
     Write-Host ("PASS -- destination has all {0} blob(s) with matching names and sizes." -f $validation.SourceCount)
     Write-Host 'Source data left untouched.'
+    Write-Host ''
+    Show-BlobComparison -Source $sourceInventory -Destination $destInventoryAfter
 }
 else {
+    Write-Host ''
+    Show-BlobComparison -Source $sourceInventory -Destination $destInventoryAfter
     throw "Validation failed:`n$($validation.Issues -join "`n")"
 }
+
+Write-Host ''
+Write-Host ('Completed at: {0:yyyy-MM-dd HH:mm:ss} UTC' -f [datetime]::UtcNow)
