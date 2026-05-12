@@ -1,0 +1,56 @@
+trigger: none
+
+parameters:
+  - name: serviceConnection
+    displayName: 'Azure Service Connection'
+    type: string
+  - name: sourceSubscriptionId
+    displayName: 'Source Subscription ID'
+    type: string
+  - name: sourceStorageAccount
+    displayName: 'Source Storage Account Name'
+    type: string
+  - name: sourceContainer
+    displayName: 'Source Container Name'
+    type: string
+  - name: destSubscriptionId
+    displayName: 'Destination Subscription ID'
+    type: string
+  - name: destStorageAccount
+    displayName: 'Destination Storage Account Name'
+    type: string
+  - name: destContainer
+    displayName: 'Destination Container Name'
+    type: string
+
+name: storage-migration_$(Date:yyyyMMdd)$(Rev:.r)
+
+pool:
+  name: GEA-FT-Mngt-Pool
+
+stages:
+  - stage: StorageMigration
+    displayName: 'Storage Migration'
+    jobs:
+      - job: Migrate
+        displayName: 'Migrate Container'
+        workspace:
+          clean: all
+        steps:
+          - checkout: self
+
+          - task: AzurePowerShell@5
+            displayName: 'Run storage migration'
+            inputs:
+              azureSubscription: ${{ parameters.serviceConnection }}
+              ScriptType: FilePath
+              ScriptPath: scripts/storage-migration.ps1
+              ScriptArguments: >-
+                -SourceSubscriptionId '${{ parameters.sourceSubscriptionId }}'
+                -SourceStorageAccount '${{ parameters.sourceStorageAccount }}'
+                -SourceContainer '${{ parameters.sourceContainer }}'
+                -DestSubscriptionId '${{ parameters.destSubscriptionId }}'
+                -DestStorageAccount '${{ parameters.destStorageAccount }}'
+                -DestContainer '${{ parameters.destContainer }}'
+              azurePowerShellVersion: LatestVersion
+              pwsh: true
