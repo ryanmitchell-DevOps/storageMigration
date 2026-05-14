@@ -418,18 +418,14 @@ if ($failed.Count -gt 0) {
     }
 }
 
-$postStatus = Show-MigrationStatus -Source $sourceInventory `
-                                   -Destination $destInventoryAfter `
-                                   -Label 'POST-MIGRATION STATUS'
+$null = Show-MigrationStatus -Source $sourceInventory `
+                             -Destination $destInventoryAfter `
+                             -Label 'POST-MIGRATION STATUS'
 
-if ($azCopyError) {
-    throw $azCopyError
-}
-if ($postStatus.PendingCount -ne 0) {
-    throw "Post-migration pending is not zero ($($postStatus.PendingCount)). See logs in $logDir"
-}
-
-# Final validation
+# Final validation -- always runs so the full comparison table (size + MD5)
+# is logged, even when there are issues. Test-MigrationCompleteness is the
+# single source of truth for missing / size / MD5 problems; the script throws
+# only after the table has rendered.
 Write-Log 'VALIDATION'
 $validation = Test-MigrationCompleteness -Source $sourceInventory `
                                          -Destination $destInventoryAfter
@@ -455,6 +451,14 @@ else {
     foreach ($issue in $validation.Issues) {
         Write-Host ("  $($script:Ansi.Red){0}$($script:Ansi.Reset)" -f $issue)
     }
+}
+
+# Failure throws happen here, after the table has been logged, so the user can
+# see exactly which blob failed and why before the pipeline step exits.
+if ($azCopyError) {
+    throw $azCopyError
+}
+if (-not $validation.Passed) {
     throw "Validation failed:`n$($validation.Issues -join "`n")"
 }
 
