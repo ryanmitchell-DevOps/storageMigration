@@ -13,6 +13,14 @@ param(
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
+# ANSI color codes — Azure DevOps logs render these; pwsh 7+ supports `e
+$script:Ansi = @{
+    Reset  = "`e[0m"
+    Red    = "`e[91m"
+    Green  = "`e[92m"
+    Yellow = "`e[93m"
+}
+
 # Functions
 function Write-Log {
     param([string]$LogMessage)
@@ -60,7 +68,22 @@ function Assert-ContainerExists {
     if (-not $exists) {
         throw "Container '$Container' does not exist in storage account '$AccountName'. Ensure the container exists before running this migration."
     }
-    Write-Host "Container '$Container' found in '$AccountName'."
+    Write-Host ("$($script:Ansi.Green)Container '{0}' found in '{1}'.$($script:Ansi.Reset)" -f $Container, $AccountName)
+}
+
+function Get-BlobMD5 {
+    param($Blob)
+    try {
+        # Newer Az.Storage: BlobProperties.ContentHash is a byte[]
+        if ($Blob.PSObject.Properties['BlobProperties'] -and $Blob.BlobProperties -and $Blob.BlobProperties.ContentHash) {
+            return [Convert]::ToBase64String($Blob.BlobProperties.ContentHash)
+        }
+        # Older Az.Storage: ICloudBlob.Properties.ContentMD5 is already base64
+        if ($Blob.PSObject.Properties['ICloudBlob'] -and $Blob.ICloudBlob -and $Blob.ICloudBlob.Properties.ContentMD5) {
+            return $Blob.ICloudBlob.Properties.ContentMD5
+        }
+    } catch { }
+    return $null
 }
 
 function Get-BlobInventory {
@@ -72,11 +95,37 @@ function Get-BlobInventory {
     $count = 0
     Get-AzStorageBlob -Container $Container -Context $Context -ErrorAction Stop |
     ForEach-Object {
-        $map[$_.Name] = [pscustomobject]@{ Name = $_.Name; Length = $_.Length }
+        $map[$_.Name] = [pscustomobject]@{
+            Name   = $_.Name
+            Length = $_.Length
+            MD5    = (Get-BlobMD5 -Blob $_)
+        }
         $count++
         if ($count % 10000 -eq 0) { Write-Host " inventoried $count blobs..." }
     }
     return $map
+}
+
+function Show-BlobList {
+    param(
+        [string]$Heading,
+        [string[]]$Names,
+        [hashtable]$SizeSource,
+        [int]$Limit = 50,
+        [string]$Color = ''
+    )
+    if ($Names.Count -eq 0) { return }
+    $shown = [Math]::Min($Names.Count, $Limit)
+    Write-Host ''
+    if ($Color) {
+        Write-Host ("  {0}{1}:{2}" -f $Color, $Heading, $script:Ansi.Reset)
+    } else {
+        Write-Host ('  {0}:' -f $Heading)
+    }
+    $Names | Sort-Object | Select-Object -First $shown | ForEach-Object {
+        Write-Host ('    {0,-60} {1,10}' -f $_, (Format-FileSize $SizeSource[$_].Length))
+    }
+    if ($Names.Count -gt $shown) { Write-Host "    ... and $($Names.Count - $shown) more" }
 }
 
 function Show-MigrationStatus {
@@ -87,8 +136,25 @@ function Show-MigrationStatus {
     )
     $sourceCount = $Source.Count
     $destCount = $Destination.Count
-    $pending = @($Source.Keys | Where-Object { -not $Destination.ContainsKey($_) })
+
+    $missing = New-Object System.Collections.Generic.List[string]
+    $outOfSync = New-Object System.Collections.Generic.List[string]
+    $matched = New-Object System.Collections.Generic.List[string]
+    foreach ($name in $Source.Keys) {
+        if (-not $Destination.ContainsKey($name)) {
+            $missing.Add($name)
+        }
+        elseif ($Source[$name].Length -ne $Destination[$name].Length) {
+            $outOfSync.Add($name)
+        }
+        else {
+            $matched.Add($name)
+        }
+    }
+
+    $pending = @($missing) + @($outOfSync)
     $pendingCount = $pending.Count
+    $matchedCount = $matched.Count
     $pendingPct = if ($sourceCount -gt 0) {
         [math]::Round(($pendingCount / $sourceCount) * 100, 2)
     } else { 0 }
@@ -97,17 +163,13 @@ function Show-MigrationStatus {
     Write-Log $Label
     Write-Host ('Source blobs:      {0}' -f $sourceCount)
     Write-Host ('Destination blobs: {0}' -f $destCount)
-    Write-Host ('Already migrated:  {0} ({1}%)' -f ($sourceCount - $pendingCount), $migratedPct)
-    Write-Host ('Pending:           {0} ({1}%)' -f $pendingCount, $pendingPct)
-    if ($pendingCount -gt 0) {
-        $listLimit = [Math]::Min($pendingCount, 50)
-        Write-Host ''
-        Write-Host '  Pending blobs:'
-        $pending | Sort-Object | Select-Object -First $listLimit | ForEach-Object {
-            Write-Host ('    {0,-60} {1,10}' -f $_, (Format-FileSize $Source[$_].Length))
-        }
-        if ($pendingCount -gt $listLimit) { Write-Host "    ... and $($pendingCount - $listLimit) more" }
-    }
+    Write-Host ('Already migrated:  {0} ({1}%)' -f $matchedCount, $migratedPct)
+    Write-Host ('Pending:           {0} ({1}%)  [missing: {2}, out-of-sync: {3}]' -f `
+        $pendingCount, $pendingPct, $missing.Count, $outOfSync.Count)
+
+    Show-BlobList -Heading 'Missing from destination'   -Names $missing   -SizeSource $Source -Color $script:Ansi.Red
+    Show-BlobList -Heading 'Out of sync (size differs)' -Names $outOfSync -SizeSource $Source -Color $script:Ansi.Yellow
+    Show-BlobList -Heading 'Already in destination'     -Names $matched   -SizeSource $Source -Color $script:Ansi.Green
 
     return [pscustomobject]@{
         SourceCount    = $sourceCount
@@ -115,6 +177,9 @@ function Show-MigrationStatus {
         PendingCount   = $pendingCount
         PendingPercent = $pendingPct
         PendingNames   = $pending
+        MissingNames   = @($missing)
+        OutOfSyncNames = @($outOfSync)
+        MatchedNames   = @($matched)
     }
 }
 
@@ -170,36 +235,76 @@ function Test-MigrationCompleteness {
         $sizeMismatch | Select-Object -First 10 | ForEach-Object { $issues.Add(" - $_") }
     }
 
+    $md5Mismatch = foreach ($name in $Source.Keys) {
+        if ($Destination.ContainsKey($name) -and
+            $Source[$name].MD5 -and $Destination[$name].MD5 -and
+            $Source[$name].MD5 -ne $Destination[$name].MD5) { $name }
+    }
+    $md5Mismatch = @($md5Mismatch)
+    if ($md5Mismatch.Count -gt 0) {
+        $issues.Add("MD5 mismatch: $($md5Mismatch.Count) blob(s)")
+        $md5Mismatch | Select-Object -First 10 | ForEach-Object { $issues.Add(" - $_") }
+    }
+
+    $noMd5 = @($Source.Keys | Where-Object {
+        -not $Source[$_].MD5 -or
+        ($Destination.ContainsKey($_) -and -not $Destination[$_].MD5)
+    })
+
+    $md5Verified = $Source.Count - $noMd5.Count - $md5Mismatch.Count
+
     return [pscustomobject]@{
-        Passed      = ($issues.Count -eq 0)
-        Issues      = $issues
-        SourceCount = $Source.Count
-        DestCount   = $Destination.Count
+        Passed         = ($issues.Count -eq 0)
+        Issues         = $issues
+        SourceCount    = $Source.Count
+        DestCount      = $Destination.Count
+        NoMd5Count     = $noMd5.Count
+        Md5VerifiedCount = $md5Verified
+        Md5MismatchCount = $md5Mismatch.Count
     }
 }
 
 function Show-BlobComparison {
     param([hashtable]$Source, [hashtable]$Destination)
-    $fmt = '  {0,-60} {1,12} {2,12}  {3}'
-    Write-Host ($fmt -f 'Blob Name', 'Source', 'Destination', 'Match')
-    Write-Host ($fmt -f ('-' * 60), ('-' * 12), ('-' * 12), '-----')
+    $base = '  {0,-60} {1,12} {2,12}'
+    Write-Host (($base -f 'Blob Name', 'Source', 'Destination') + '  Size      MD5')
+    Write-Host (($base -f ('-' * 60), ('-' * 12), ('-' * 12)) + '  --------  --------')
     [long]$totalSrc = 0
     [long]$totalDst = 0
     foreach ($name in ($Source.Keys | Sort-Object)) {
-        $srcSize = $Source[$name].Length
+        $srcBlob = $Source[$name]
+        $srcSize = $srcBlob.Length
         $totalSrc += $srcSize
+
         if ($Destination.ContainsKey($name)) {
-            $dstSize = $Destination[$name].Length
+            $dstBlob = $Destination[$name]
+            $dstSize = $dstBlob.Length
             $totalDst += $dstSize
-            $match = if ($srcSize -eq $dstSize) { 'OK' } else { 'MISMATCH' }
-            Write-Host ($fmt -f $name, (Format-FileSize $srcSize), (Format-FileSize $dstSize), $match)
+
+            $sizeCell = if ($srcSize -eq $dstSize) {
+                "$($script:Ansi.Green){0,-8}$($script:Ansi.Reset)" -f 'OK'
+            } else {
+                "$($script:Ansi.Red){0,-8}$($script:Ansi.Reset)" -f 'MISMATCH'
+            }
+
+            $md5Cell = if (-not $srcBlob.MD5 -or -not $dstBlob.MD5) {
+                "$($script:Ansi.Yellow){0,-8}$($script:Ansi.Reset)" -f 'N/A'
+            } elseif ($srcBlob.MD5 -eq $dstBlob.MD5) {
+                "$($script:Ansi.Green){0,-8}$($script:Ansi.Reset)" -f 'OK'
+            } else {
+                "$($script:Ansi.Red){0,-8}$($script:Ansi.Reset)" -f 'MISMATCH'
+            }
+
+            Write-Host (($base -f $name, (Format-FileSize $srcSize), (Format-FileSize $dstSize)) + "  $sizeCell  $md5Cell")
         }
         else {
-            Write-Host ($fmt -f $name, (Format-FileSize $srcSize), 'MISSING', 'MISSING')
+            $sizeCell = "$($script:Ansi.Red){0,-8}$($script:Ansi.Reset)" -f 'MISSING'
+            $md5Cell  = "$($script:Ansi.Red){0,-8}$($script:Ansi.Reset)" -f '-'
+            Write-Host (($base -f $name, (Format-FileSize $srcSize), 'MISSING') + "  $sizeCell  $md5Cell")
         }
     }
-    Write-Host ($fmt -f ('-' * 60), ('-' * 12), ('-' * 12), '-----')
-    Write-Host ($fmt -f 'TOTAL', (Format-FileSize $totalSrc), (Format-FileSize $totalDst), '')
+    Write-Host (($base -f ('-' * 60), ('-' * 12), ('-' * 12)) + '  --------  --------')
+    Write-Host ($base -f 'TOTAL', (Format-FileSize $totalSrc), (Format-FileSize $totalDst))
 }
 
 # Script
@@ -258,32 +363,68 @@ if ($PSCmdlet.ShouldProcess(
     "Copy to $DestStorageAccount/$DestContainer")) {
 
     Write-Log 'MIGRATING'
-    Invoke-AzCopySync -SourceAccount $SourceStorageAccount `
-                      -SourceContainer $SourceContainer `
-                      -DestAccount $DestStorageAccount `
-                      -DestContainer $DestContainer
-
-    Write-Log 'TRANSFERRED FILES'
-    [long]$transferTotal = 0
-    $preStatus.PendingNames | Sort-Object | ForEach-Object {
-        $size = $sourceInventory[$_].Length
-        $transferTotal += $size
-        Write-Host ('  {0,-60} {1,10}' -f $_, (Format-FileSize $size))
+    $azCopyError = $null
+    try {
+        Invoke-AzCopySync -SourceAccount $SourceStorageAccount `
+                          -SourceContainer $SourceContainer `
+                          -DestAccount $DestStorageAccount `
+                          -DestContainer $DestContainer
     }
-    Write-Host ''
-    Write-Host ('  Total: {0} file(s), {1}' -f $preStatus.PendingNames.Count, (Format-FileSize $transferTotal))
+    catch {
+        $azCopyError = $_
+        Write-Warning $azCopyError.Exception.Message
+    }
 }
 else {
     Write-Warning 'Dry run (-WhatIf) -- no data copied.'
     return
 }
 
-# Post-check
+# Re-inventory destination to derive real transfer outcome
 $destInventoryAfter = Get-BlobInventory -Context $destCtx -Container $DestContainer
+
+$transferred = New-Object System.Collections.Generic.List[string]
+$failed = New-Object System.Collections.Generic.List[string]
+foreach ($name in $preStatus.PendingNames) {
+    if ($destInventoryAfter.ContainsKey($name) -and
+        $destInventoryAfter[$name].Length -eq $sourceInventory[$name].Length) {
+        $transferred.Add($name)
+    }
+    else {
+        $failed.Add($name)
+    }
+}
+
+if ($transferred.Count -gt 0) {
+    Write-Log 'TRANSFERRED FILES'
+    [long]$transferTotal = 0
+    $transferred | Sort-Object | ForEach-Object {
+        $size = $sourceInventory[$_].Length
+        $transferTotal += $size
+        Write-Host ('  {0,-60} {1,10}' -f $_, (Format-FileSize $size))
+    }
+    Write-Host ''
+    Write-Host ('  Total: {0} file(s), {1}' -f $transferred.Count, (Format-FileSize $transferTotal))
+}
+
+if ($failed.Count -gt 0) {
+    Write-Log 'FAILED FILES'
+    Write-Host ("  $($script:Ansi.Red){0} blob(s) were pending but did not reach the destination intact.$($script:Ansi.Reset)" -f $failed.Count)
+    Write-Host ('  See AzCopy logs in {0}' -f $logDir)
+    Write-Host ''
+    $failed | Sort-Object | ForEach-Object {
+        $size = $sourceInventory[$_].Length
+        Write-Host ("  $($script:Ansi.Red){0,-60}$($script:Ansi.Reset) {1,10}" -f $_, (Format-FileSize $size))
+    }
+}
+
 $postStatus = Show-MigrationStatus -Source $sourceInventory `
                                    -Destination $destInventoryAfter `
                                    -Label 'POST-MIGRATION STATUS'
 
+if ($azCopyError) {
+    throw $azCopyError
+}
 if ($postStatus.PendingCount -ne 0) {
     throw "Post-migration pending is not zero ($($postStatus.PendingCount)). See logs in $logDir"
 }
@@ -292,8 +433,16 @@ if ($postStatus.PendingCount -ne 0) {
 Write-Log 'VALIDATION'
 $validation = Test-MigrationCompleteness -Source $sourceInventory `
                                          -Destination $destInventoryAfter
+Write-Host ('Comparing {0} source blob(s) against {1} destination blob(s)...' -f $validation.SourceCount, $validation.DestCount)
+Write-Host ''
 if ($validation.Passed) {
-    Write-Host ("PASS -- destination has all {0} blob(s) with matching names and sizes." -f $validation.SourceCount)
+    Write-Host ("$($script:Ansi.Green)PASS$($script:Ansi.Reset) -- destination has all {0} blob(s) with matching names and sizes." -f $validation.SourceCount)
+    if ($validation.Md5VerifiedCount -gt 0) {
+        Write-Host ("$($script:Ansi.Green)MD5 verified:$($script:Ansi.Reset) {0} of {1} blob(s)." -f $validation.Md5VerifiedCount, $validation.SourceCount)
+    }
+    if ($validation.NoMd5Count -gt 0) {
+        Write-Host ("$($script:Ansi.Yellow)NOTE:$($script:Ansi.Reset) {0} blob(s) have no Content-MD5 set; checksum couldn't be compared for those." -f $validation.NoMd5Count)
+    }
     Write-Host 'Source data left untouched.'
     Write-Host ''
     Show-BlobComparison -Source $sourceInventory -Destination $destInventoryAfter
@@ -301,6 +450,11 @@ if ($validation.Passed) {
 else {
     Write-Host ''
     Show-BlobComparison -Source $sourceInventory -Destination $destInventoryAfter
+    Write-Host ''
+    Write-Host "$($script:Ansi.Red)FAIL$($script:Ansi.Reset) -- validation issues found:"
+    foreach ($issue in $validation.Issues) {
+        Write-Host ("  $($script:Ansi.Red){0}$($script:Ansi.Reset)" -f $issue)
+    }
     throw "Validation failed:`n$($validation.Issues -join "`n")"
 }
 
