@@ -29,7 +29,6 @@ function Write-LogDirectory {
     else { $dir = Join-Path ([IO.Path]::GetTempPath()) "azcopy-logs-$(Get-Date -Format yyyyMMddHHmmss)" }
 
     if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-    Write-Host "Log directory: $dir"
     return $dir
 }
 
@@ -207,25 +206,41 @@ function Show-BlobComparison {
 $logDir = Write-LogDirectory -Log $LogDirectory
 Set-AzCopyEnvironment -LogDirectory $logDir
 
-Write-Log "Migration: $SourceStorageAccount/$SourceContainer -> $DestStorageAccount/$DestContainer"
-Write-Host "Source sub: $SourceSubscriptionId"
-Write-Host "Dest sub: $DestSubscriptionId"
+Write-Log 'MIGRATION CONFIGURATION'
+Write-Host ('Start time:        {0:yyyy-MM-dd HH:mm:ss} UTC' -f [datetime]::UtcNow)
+Write-Host ('Log directory:     {0}' -f $logDir)
+Write-Host ''
+Write-Host 'Source'
+Write-Host ('  Subscription:    {0}' -f $SourceSubscriptionId)
+Write-Host ('  Storage account: {0}' -f $SourceStorageAccount)
+Write-Host ('  Container:       {0}' -f $SourceContainer)
+Write-Host ('  URL:             https://{0}.blob.core.windows.net/{1}' -f $SourceStorageAccount, $SourceContainer)
+Write-Host ''
+Write-Host 'Destination'
+Write-Host ('  Subscription:    {0}' -f $DestSubscriptionId)
+Write-Host ('  Storage account: {0}' -f $DestStorageAccount)
+Write-Host ('  Container:       {0}' -f $DestContainer)
+Write-Host ('  URL:             https://{0}.blob.core.windows.net/{1}' -f $DestStorageAccount, $DestContainer)
 
-# Pre-check: verify both containers exist before doing any work
+Write-Log 'PREPARATION CHECKS'
+
+Write-Host '[1/3] Verifying source container exists...'
 Set-SubscriptionContext -SubscriptionId $SourceSubscriptionId
 $sourceCtx = Get-StorageContext -AccountName $SourceStorageAccount
 Assert-ContainerExists -Context $sourceCtx -Container $SourceContainer -AccountName $SourceStorageAccount
 
+Write-Host '[2/3] Verifying destination container exists...'
 Set-SubscriptionContext -SubscriptionId $DestSubscriptionId
 $destCtx = Get-StorageContext -AccountName $DestStorageAccount
 Assert-ContainerExists -Context $destCtx -Container $DestContainer -AccountName $DestStorageAccount
 
-# Pre-check: inventory both containers
+Write-Host '[3/3] Inventorying source and destination containers...'
 Set-SubscriptionContext -SubscriptionId $SourceSubscriptionId
 $sourceInventory = Get-BlobInventory -Context $sourceCtx -Container $SourceContainer
-
 Set-SubscriptionContext -SubscriptionId $DestSubscriptionId
 $destInventoryBefore = Get-BlobInventory -Context $destCtx -Container $DestContainer
+Write-Host ('       Source inventoried:      {0} blob(s)' -f $sourceInventory.Count)
+Write-Host ('       Destination inventoried: {0} blob(s)' -f $destInventoryBefore.Count)
 
 $preStatus = Show-MigrationStatus -Source $sourceInventory `
                                   -Destination $destInventoryBefore `

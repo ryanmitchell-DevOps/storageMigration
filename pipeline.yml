@@ -54,3 +54,10 @@ stages:
                 -DestContainer '${{ parameters.destContainer }}'
               azurePowerShellVersion: LatestVersion
               pwsh: true
+
+          - task: PublishPipelineArtifact@1
+            displayName: 'Publish azcopy logs'
+            condition: always()
+            inputs:
+              targetPath: '$(Build.ArtifactStagingDirectory)/azcopy-logs'
+              artifact: 'azcopy-logs'
