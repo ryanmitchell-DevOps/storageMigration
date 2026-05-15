@@ -308,11 +308,12 @@ function Show-BlobComparison {
 }
 
 # Script
+$migrationStart = [datetime]::UtcNow
 $logDir = Write-LogDirectory -Log $LogDirectory
 Set-AzCopyEnvironment -LogDirectory $logDir
 
 Write-Log 'MIGRATION CONFIGURATION'
-Write-Host ('Start time:        {0:yyyy-MM-dd HH:mm:ss} UTC' -f [datetime]::UtcNow)
+Write-Host ('Start time:        {0:yyyy-MM-dd HH:mm:ss} UTC' -f $migrationStart)
 Write-Host ('Log directory:     {0}' -f $logDir)
 Write-Host ''
 Write-Host 'Source'
@@ -453,14 +454,25 @@ else {
     }
 }
 
-# Failure throws happen here, after the table has been logged, so the user can
-# see exactly which blob failed and why before the pipeline step exits.
+$migrationEnd = [datetime]::UtcNow
+$elapsed = $migrationEnd - $migrationStart
+$elapsedText = if ($elapsed.TotalDays -ge 1) {
+    '{0} day(s) {1:hh\:mm\:ss}' -f [int]$elapsed.TotalDays, $elapsed
+} else {
+    '{0:hh\:mm\:ss}' -f $elapsed
+}
+
+Write-Log 'MIGRATION TIME'
+Write-Host ('Migration started:  {0:yyyy-MM-dd HH:mm:ss} UTC' -f $migrationStart)
+Write-Host ('Migration ended:    {0:yyyy-MM-dd HH:mm:ss} UTC' -f $migrationEnd)
+Write-Host ('Total time elapsed: {0}' -f $elapsedText)
+
+# Failure throws happen here, after the table and timing have been logged, so
+# the user can see exactly which blob failed and how long the run took before
+# the pipeline step exits.
 if ($azCopyError) {
     throw $azCopyError
 }
 if (-not $validation.Passed) {
     throw "Validation failed:`n$($validation.Issues -join "`n")"
 }
-
-Write-Host ''
-Write-Host ('Completed at: {0:yyyy-MM-dd HH:mm:ss} UTC' -f [datetime]::UtcNow)
