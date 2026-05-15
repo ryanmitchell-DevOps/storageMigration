@@ -1,3 +1,7 @@
+#Requires -Version 7.0
+#Requires -PSEdition Core
+#Requires -Modules Az.Accounts, Az.Storage
+
 [CmdletBinding(SupportsShouldProcess)]
 param(
     [Parameter(Mandatory)][string]$SourceSubscriptionId,
@@ -10,6 +14,7 @@ param(
     [string]$LogDirectory
 )
 
+Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
@@ -96,9 +101,10 @@ function Get-BlobInventory {
     Get-AzStorageBlob -Container $Container -Context $Context -ErrorAction Stop |
     ForEach-Object {
         $map[$_.Name] = [pscustomobject]@{
-            Name   = $_.Name
-            Length = $_.Length
-            MD5    = (Get-BlobMD5 -Blob $_)
+            Name     = $_.Name
+            Length   = $_.Length
+            MD5      = (Get-BlobMD5 -Blob $_)
+            BlobType = [string]$_.BlobType
         }
         $count++
         if ($count % 10000 -eq 0) { Write-Host " inventoried $count blobs..." }
@@ -123,7 +129,7 @@ function Show-BlobList {
         Write-Host ('  {0}:' -f $Heading)
     }
     $Names | Sort-Object | Select-Object -First $shown | ForEach-Object {
-        Write-Host ('    {0,-60} {1,10}' -f $_, (Format-FileSize $SizeSource[$_].Length))
+        Write-Host ('    {0,-50} {1,-10} {2,10}' -f $_, $SizeSource[$_].BlobType, (Format-FileSize $SizeSource[$_].Length))
     }
     if ($Names.Count -gt $shown) { Write-Host "    ... and $($Names.Count - $shown) more" }
 }
@@ -281,9 +287,9 @@ function Test-MigrationCompleteness {
 
 function Show-BlobComparison {
     param([hashtable]$Source, [hashtable]$Destination)
-    $base = '  {0,-60} {1,12} {2,12}'
-    Write-Host (($base -f 'Blob Name', 'Source', 'Destination') + '  Size      MD5')
-    Write-Host (($base -f ('-' * 60), ('-' * 12), ('-' * 12)) + '  --------  --------')
+    $base = '  {0,-50} {1,-10} {2,12} {3,12}'
+    Write-Host (($base -f 'Blob Name', 'Type', 'Source', 'Destination') + '  Size      MD5')
+    Write-Host (($base -f ('-' * 50), ('-' * 10), ('-' * 12), ('-' * 12)) + '  --------  --------')
     [long]$totalSrc = 0
     [long]$totalDst = 0
     foreach ($name in ($Source.Keys | Sort-Object)) {
@@ -310,16 +316,16 @@ function Show-BlobComparison {
                 "$($script:Ansi.Red){0,-8}$($script:Ansi.Reset)" -f 'MISMATCH'
             }
 
-            Write-Host (($base -f $name, (Format-FileSize $srcSize), (Format-FileSize $dstSize)) + "  $sizeCell  $md5Cell")
+            Write-Host (($base -f $name, $srcBlob.BlobType, (Format-FileSize $srcSize), (Format-FileSize $dstSize)) + "  $sizeCell  $md5Cell")
         }
         else {
             $sizeCell = "$($script:Ansi.Red){0,-8}$($script:Ansi.Reset)" -f 'MISSING'
             $md5Cell  = "$($script:Ansi.Red){0,-8}$($script:Ansi.Reset)" -f '-'
-            Write-Host (($base -f $name, (Format-FileSize $srcSize), 'MISSING') + "  $sizeCell  $md5Cell")
+            Write-Host (($base -f $name, $srcBlob.BlobType, (Format-FileSize $srcSize), 'MISSING') + "  $sizeCell  $md5Cell")
         }
     }
-    Write-Host (($base -f ('-' * 60), ('-' * 12), ('-' * 12)) + '  --------  --------')
-    Write-Host ($base -f 'TOTAL', (Format-FileSize $totalSrc), (Format-FileSize $totalDst))
+    Write-Host (($base -f ('-' * 50), ('-' * 10), ('-' * 12), ('-' * 12)) + '  --------  --------')
+    Write-Host ($base -f 'TOTAL', '', (Format-FileSize $totalSrc), (Format-FileSize $totalDst))
 }
 
 # Script
@@ -417,7 +423,7 @@ if ($transferred.Count -gt 0) {
     $transferred | Sort-Object | ForEach-Object {
         $size = $sourceInventory[$_].Length
         $transferTotal += $size
-        Write-Host ('  {0,-60} {1,10}' -f $_, (Format-FileSize $size))
+        Write-Host ('  {0,-50} {1,-10} {2,10}' -f $_, $sourceInventory[$_].BlobType, (Format-FileSize $size))
     }
     Write-Host ''
     Write-Host ('  Total: {0} file(s), {1}' -f $transferred.Count, (Format-FileSize $transferTotal))
@@ -430,7 +436,7 @@ if ($failed.Count -gt 0) {
     Write-Host ''
     $failed | Sort-Object | ForEach-Object {
         $size = $sourceInventory[$_].Length
-        Write-Host ("  $($script:Ansi.Red){0,-60}$($script:Ansi.Reset) {1,10}" -f $_, (Format-FileSize $size))
+        Write-Host ("  $($script:Ansi.Red){0,-50}$($script:Ansi.Reset) {1,-10} {2,10}" -f $_, $sourceInventory[$_].BlobType, (Format-FileSize $size))
     }
 }
 
@@ -448,12 +454,13 @@ $validation = Test-MigrationCompleteness -Source $sourceInventory `
 Write-Host ('Comparing {0} source blob(s) against {1} destination blob(s)...' -f $validation.SourceCount, $validation.DestCount)
 Write-Host ''
 if ($validation.Passed) {
-    Write-Host ("$($script:Ansi.Green)PASS$($script:Ansi.Reset) -- destination has all {0} blob(s) with matching names and sizes." -f $validation.SourceCount)
-    if ($validation.Md5VerifiedCount -gt 0) {
-        Write-Host ("$($script:Ansi.Green)MD5 verified:$($script:Ansi.Reset) {0} of {1} blob(s)." -f $validation.Md5VerifiedCount, $validation.SourceCount)
-    }
     if ($validation.NoMd5Count -gt 0) {
-        Write-Host ("$($script:Ansi.Yellow)NOTE:$($script:Ansi.Reset) {0} blob(s) have no Content-MD5 set; checksum couldn't be compared for those." -f $validation.NoMd5Count)
+        Write-Host ("$($script:Ansi.Yellow)PASS (sizes only)$($script:Ansi.Reset) -- {0} of {1} blob(s) were not checksum-verified (no Content-MD5 set). Names and sizes match for all {1} blob(s)." -f $validation.NoMd5Count, $validation.SourceCount)
+        if ($validation.Md5VerifiedCount -gt 0) {
+            Write-Host ("$($script:Ansi.Green)MD5 verified:$($script:Ansi.Reset) {0} of {1} blob(s)." -f $validation.Md5VerifiedCount, $validation.SourceCount)
+        }
+    } else {
+        Write-Host ("$($script:Ansi.Green)PASS$($script:Ansi.Reset) -- destination has all {0} blob(s) with matching names, sizes, and MD5 checksums." -f $validation.SourceCount)
     }
     Write-Host 'Source data left untouched.'
     Write-Host ''
