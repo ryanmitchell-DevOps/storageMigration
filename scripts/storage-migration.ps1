@@ -207,8 +207,23 @@ function Invoke-AzCopySync {
         '--delete-destination=false'
     )
 
+    # Suppress Job Summary lines that don't apply to blob sync (no folders,
+    # symlinks, hardlinks, or destination deletes in this configuration).
+    $skipRegex = '^(' + (@(
+        'Number of Copy Transfers for Folder Properties:',
+        'Number of Symlink Transfers:',
+        'Total Number of Copy Transfers:',
+        'Number of Deletions at Destination:',
+        'Number of Symbolic Links Skipped:',
+        'Number of Special Files Skipped:',
+        'Number of Hardlinks Converted:',
+        'Number of Hardlinks Skipped:'
+    ) -join '|') + ')'
+
     Write-Host "##[command]azcopy $($azArgs -join ' ')"
-    & azcopy @azArgs
+    & azcopy @azArgs | ForEach-Object {
+        if ($_ -notmatch $skipRegex) { Write-Host $_ }
+    }
     if ($LASTEXITCODE -ne 0) {
         throw "AzCopy sync failed with exit code $LASTEXITCODE. See logs in $env:AZCOPY_LOG_LOCATION"
     }
