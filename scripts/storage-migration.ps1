@@ -379,6 +379,12 @@ $migrationStart = [datetime]::UtcNow
 $logDir = Write-LogDirectory -Log $LogDirectory
 Set-AzCopyEnvironment -LogDirectory $logDir
 
+# Print AzCopy version so the pipeline log records which build is in use --
+# helps when deciding which flags (e.g. --compare-hash, --missing-hash-policy)
+# are available on the agent.
+Write-Host 'AzCopy version:'
+& azcopy --version
+
 # All work is wrapped so the MIGRATION TIME block always fires, including on
 # early returns ("nothing to migrate", -WhatIf) and on uncaught exceptions.
 try {
