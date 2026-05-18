@@ -232,11 +232,7 @@ function Invoke-AzCopySync {
     $azArgs = @(
         'sync', $sourceUrl, $destUrl,
         '--recursive=true',
-        '--delete-destination=false',
-        '--compare-hash=MD5',
-        '--put-md5',
-        '--missing-hash-policy=Generate',
-        '--output-level=essential'
+        '--delete-destination=false'
     )
 
     # Capture combined stdout+stderr so we can dump it on failure -- without
