@@ -233,8 +233,7 @@ function Invoke-AzCopySync {
         'sync', $sourceUrl, $destUrl,
         '--recursive=true',
         '--delete-destination=false',
-        '--put-md5',
-        '--compare-hash=MD5'
+        '--put-md5'
     )
 
     # Capture combined stdout+stderr so we can dump it on failure -- without
