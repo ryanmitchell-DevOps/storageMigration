@@ -235,16 +235,17 @@ function Invoke-AzCopySync {
         '--delete-destination=false',
         '--compare-hash=MD5',
         '--put-md5',
-        '--missing-hash-policy=GenerateWhenRequired',
+        '--missing-hash-policy=Generate',
         '--output-level=essential'
     )
 
-    # --output-level=essential silences INFO/progress lines on success; critical
-    # messages still print. Full raw output is preserved in $env:AZCOPY_LOG_LOCATION
-    # for debugging. We don't redirect 2>&1 -- on pwsh that wraps stderr lines as
-    # ErrorRecord and can interact badly with StrictMode.
-    & azcopy @azArgs
+    # Capture combined stdout+stderr so we can dump it on failure -- without
+    # this, AzCopy's actual error reason is invisible in the pipeline log and
+    # we only see our own generic "exit code N" message. Full raw output is
+    # also preserved in $env:AZCOPY_LOG_LOCATION.
+    $output = & azcopy @azArgs 2>&1
     if ($LASTEXITCODE -ne 0) {
+        $output | ForEach-Object { Write-Host $_ }
         throw "AzCopy sync failed with exit code $LASTEXITCODE. See logs in $env:AZCOPY_LOG_LOCATION"
     }
 }
