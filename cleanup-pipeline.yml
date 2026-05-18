@@ -1,0 +1,89 @@
+trigger: none
+
+parameters:
+  - name: serviceConnection
+    displayName: 'Azure Service Connection'
+    type: string
+  - name: destSubscriptionId
+    displayName: 'Destination Subscription ID'
+    type: string
+  - name: destStorageAccount
+    displayName: 'Destination Storage Account Name'
+    type: string
+  - name: destContainer
+    displayName: 'Destination Container Name'
+    type: string
+
+name: storage-cleanup_$(Date:yyyyMMdd)$(Rev:.r)
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+  # Stage 1: Preview only -- inventories the destination container and lists
+  # every blob that *would* be deleted. Runs the script with -WhatIf so no
+  # data is touched. Approvers should read this stage's log before approving
+  # the next stage.
+  - stage: Preview
+    displayName: 'Preview destination contents (no deletion)'
+    jobs:
+      - job: Preview
+        displayName: 'Inventory destination container'
+        workspace:
+          clean: all
+        steps:
+          - checkout: self
+
+          - task: AzurePowerShell@5
+            displayName: 'Inventory destination (-WhatIf, read-only)'
+            inputs:
+              azureSubscription: ${{ parameters.serviceConnection }}
+              ScriptType: FilePath
+              ScriptPath: scripts/clear-destination-container.ps1
+              ScriptArguments: >-
+                -SubscriptionId '${{ parameters.destSubscriptionId }}'
+                -StorageAccount '${{ parameters.destStorageAccount }}'
+                -Container '${{ parameters.destContainer }}'
+                -WhatIf
+              azurePowerShellVersion: LatestVersion
+              pwsh: true
+
+  # Stage 2: Destructive deletion -- gated by the 'storage-cleanup-approval'
+  # environment, which must have a manual Approval check configured in the
+  # Azure DevOps UI (Pipelines -> Environments -> Approvals and checks).
+  # The deployment job will pause here and wait for an approver before running.
+  - stage: Delete
+    displayName: 'Delete destination contents (requires approval)'
+    dependsOn: Preview
+    condition: succeeded()
+    jobs:
+      - deployment: Delete
+        displayName: 'Clear destination container'
+        environment: 'storage-cleanup-approval'
+        workspace:
+          clean: all
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - task: AzurePowerShell@5
+                  displayName: 'Clear destination container'
+                  inputs:
+                    azureSubscription: ${{ parameters.serviceConnection }}
+                    ScriptType: FilePath
+                    ScriptPath: scripts/clear-destination-container.ps1
+                    ScriptArguments: >-
+                      -SubscriptionId '${{ parameters.destSubscriptionId }}'
+                      -StorageAccount '${{ parameters.destStorageAccount }}'
+                      -Container '${{ parameters.destContainer }}'
+                    azurePowerShellVersion: LatestVersion
+                    pwsh: true
+
+                - task: PublishPipelineArtifact@1
+                  displayName: 'Publish azcopy logs'
+                  condition: always()
+                  inputs:
+                    targetPath: '$(Build.ArtifactStagingDirectory)/azcopy-logs'
+                    artifact: 'azcopy-cleanup-logs'
