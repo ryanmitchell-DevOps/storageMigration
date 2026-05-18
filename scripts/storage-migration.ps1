@@ -213,24 +213,14 @@ function Invoke-AzCopySync {
         '--delete-destination=false'
     )
 
-    # Suppress Job Summary lines that don't apply to blob sync (no folders,
-    # symlinks, hardlinks, or destination deletes in this configuration).
-    $skipRegex = '^(' + (@(
-        'Number of Copy Transfers for Folder Properties:',
-        'Number of Symlink Transfers:',
-        'Total Number of Copy Transfers:',
-        'Number of Deletions at Destination:',
-        'Number of Symbolic Links Skipped:',
-        'Number of Special Files Skipped:',
-        'Number of Hardlinks Converted:',
-        'Number of Hardlinks Skipped:'
-    ) -join '|') + ')'
-
-    Write-Host "##[command]azcopy $($azArgs -join ' ')"
-    & azcopy @azArgs | ForEach-Object {
-        if ($_ -notmatch $skipRegex) { Write-Host $_ }
-    }
+    # AzCopy is run silently on success -- the file list and total are already
+    # printed under MIGRATING, and POST-MIGRATION STATUS + VALIDATION sections
+    # confirm the outcome. The full raw output (INFO/progress/job-summary lines)
+    # is preserved in $env:AZCOPY_LOG_LOCATION for debugging. On failure, the
+    # captured output is dumped so the cause is visible in the pipeline log.
+    $output = & azcopy @azArgs 2>&1
     if ($LASTEXITCODE -ne 0) {
+        $output | ForEach-Object { Write-Host $_ }
         throw "AzCopy sync failed with exit code $LASTEXITCODE. See logs in $env:AZCOPY_LOG_LOCATION"
     }
 }
@@ -371,7 +361,7 @@ Write-Host ('       Destination inventoried: {0} blob(s)' -f $destInventoryBefor
 
 $preStatus = Show-MigrationStatus -Source $sourceInventory `
                                   -Destination $destInventoryBefore `
-                                  -Label 'PRE-MIGRATION STATUS'
+                                  -Label 'PRE-MIGRATION STATUS -- snapshot of source vs destination before any copy operations'
 
 if ($preStatus.PendingCount -eq 0) {
     Write-Host ''
@@ -384,7 +374,16 @@ if ($PSCmdlet.ShouldProcess(
     "$($preStatus.PendingCount) blob(s) pending",
     "Copy to $DestStorageAccount/$DestContainer")) {
 
-    Write-Log 'MIGRATING'
+    Write-Log ('MIGRATING -- copying {0} pending blob(s) from source to destination' -f $preStatus.PendingCount)
+    [long]$migrationTotalSize = 0
+    $preStatus.PendingNames | Sort-Object | ForEach-Object {
+        $size = $sourceInventory[$_].Length
+        $migrationTotalSize += $size
+        Write-Host ('  {0,-50} {1,-10} {2,10}' -f $_, $sourceInventory[$_].BlobType, (Format-FileSize $size))
+    }
+    Write-Host ''
+    Write-Host ('  Total: {0} file(s), {1}' -f $preStatus.PendingCount, (Format-FileSize $migrationTotalSize))
+
     $azCopyError = $null
     try {
         Invoke-AzCopySync -SourceAccount $SourceStorageAccount `
@@ -405,28 +404,12 @@ else {
 # Re-inventory destination to derive real transfer outcome
 $destInventoryAfter = Get-BlobInventory -Context $destCtx -Container $DestContainer
 
-$transferred = New-Object System.Collections.Generic.List[string]
 $failed = New-Object System.Collections.Generic.List[string]
 foreach ($name in $preStatus.PendingNames) {
-    if ($destInventoryAfter.ContainsKey($name) -and
-        $destInventoryAfter[$name].Length -eq $sourceInventory[$name].Length) {
-        $transferred.Add($name)
-    }
-    else {
+    if (-not $destInventoryAfter.ContainsKey($name) -or
+        $destInventoryAfter[$name].Length -ne $sourceInventory[$name].Length) {
         $failed.Add($name)
     }
-}
-
-if ($transferred.Count -gt 0) {
-    Write-Log 'TRANSFERRED FILES'
-    [long]$transferTotal = 0
-    $transferred | Sort-Object | ForEach-Object {
-        $size = $sourceInventory[$_].Length
-        $transferTotal += $size
-        Write-Host ('  {0,-50} {1,-10} {2,10}' -f $_, $sourceInventory[$_].BlobType, (Format-FileSize $size))
-    }
-    Write-Host ''
-    Write-Host ('  Total: {0} file(s), {1}' -f $transferred.Count, (Format-FileSize $transferTotal))
 }
 
 if ($failed.Count -gt 0) {
@@ -442,7 +425,7 @@ if ($failed.Count -gt 0) {
 
 $null = Show-MigrationStatus -Source $sourceInventory `
                              -Destination $destInventoryAfter `
-                             -Label 'POST-MIGRATION STATUS'
+                             -Label 'POST-MIGRATION STATUS -- destination state after copy operations complete'
 
 # Final validation -- always runs so the full comparison table (size + MD5)
 # is logged, even when there are issues. Test-MigrationCompleteness is the
