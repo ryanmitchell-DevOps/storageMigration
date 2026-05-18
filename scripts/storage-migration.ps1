@@ -381,12 +381,6 @@ $migrationStart = [datetime]::UtcNow
 $logDir = Write-LogDirectory -Log $LogDirectory
 Set-AzCopyEnvironment -LogDirectory $logDir
 
-# Print AzCopy version so the pipeline log records which build is in use --
-# helps when deciding which flags (e.g. --compare-hash, --missing-hash-policy)
-# are available on the agent.
-Write-Host 'AzCopy version:'
-& azcopy --version
-
 # All work is wrapped so the MIGRATION TIME block always fires, including on
 # early returns ("nothing to migrate", -WhatIf) and on uncaught exceptions.
 try {
@@ -555,7 +549,6 @@ Write-Host ('Already in sync:     {0}' -f $preStatus.MatchedNames.Count)
 Write-Host ('Pending:             {0}' -f $preStatus.PendingCount)
 Write-Host ('  Migrated:          {0}' -f $succeeded.Count)
 Write-Host ('  Failed:            {0}' -f $failed.Count)
-Write-Host ('Bytes transferred:   {0}' -f (Format-FileSize $migrationTotalSize))
 if ($validation.DestOnlyCount -gt 0) {
     Write-Host ('Destination extras:  {0} (preserved, not in source)' -f $validation.DestOnlyCount)
 }
