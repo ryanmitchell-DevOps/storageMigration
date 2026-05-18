@@ -242,7 +242,7 @@ function Test-MigrationCompleteness {
 
     $missing = @($Source.Keys | Where-Object { -not $Destination.ContainsKey($_) })
     if ($missing.Count -gt 0) {
-        $issues.Add("Missing from destination: $($missing.Count) blob(s)")
+        $issues.Add("Missing from destination: $($missing.Count) blob(s) -- present in source but never reached destination")
         $missing | Select-Object -First 10 | ForEach-Object { $issues.Add(" - $_") }
     }
 
@@ -252,7 +252,7 @@ function Test-MigrationCompleteness {
     }
     $sizeMismatch = @($sizeMismatch)
     if ($sizeMismatch.Count -gt 0) {
-        $issues.Add("Size mismatch: $($sizeMismatch.Count) blob(s)")
+        $issues.Add("Size mismatch: $($sizeMismatch.Count) blob(s) -- byte count differs between source and destination")
         $sizeMismatch | Select-Object -First 10 | ForEach-Object { $issues.Add(" - $_") }
     }
 
@@ -263,7 +263,7 @@ function Test-MigrationCompleteness {
     }
     $md5Mismatch = @($md5Mismatch)
     if ($md5Mismatch.Count -gt 0) {
-        $issues.Add("MD5 mismatch: $($md5Mismatch.Count) blob(s)")
+        $issues.Add("MD5 mismatch: $($md5Mismatch.Count) blob(s) -- content checksum differs between source and destination")
         $md5Mismatch | Select-Object -First 10 | ForEach-Object { $issues.Add(" - $_") }
     }
 
@@ -333,7 +333,7 @@ $migrationStart = [datetime]::UtcNow
 $logDir = Write-LogDirectory -Log $LogDirectory
 Set-AzCopyEnvironment -LogDirectory $logDir
 
-Write-Log 'MIGRATION CONFIGURATION'
+Write-Log 'MIGRATION CONFIGURATION -- source and destination details for this run'
 Write-Host ('Start time:        {0:yyyy-MM-dd HH:mm:ss} UTC' -f $migrationStart)
 Write-Host ('Log directory:     {0}' -f $logDir)
 Write-Host ''
@@ -349,7 +349,7 @@ Write-Host ('  Storage account: {0}' -f $DestStorageAccount)
 Write-Host ('  Container:       {0}' -f $DestContainer)
 Write-Host ('  URL:             https://{0}.blob.core.windows.net/{1}' -f $DestStorageAccount, $DestContainer)
 
-Write-Log 'PREPARATION CHECKS'
+Write-Log 'PREPARATION CHECKS -- verifying containers and inventorying blobs before migration'
 
 Write-Host '[1/3] Verifying source container exists...'
 Set-SubscriptionContext -SubscriptionId $SourceSubscriptionId
@@ -448,7 +448,7 @@ $null = Show-MigrationStatus -Source $sourceInventory `
 # is logged, even when there are issues. Test-MigrationCompleteness is the
 # single source of truth for missing / size / MD5 problems; the script throws
 # only after the table has rendered.
-Write-Log 'VALIDATION'
+Write-Log 'VALIDATION -- comparing source to destination by name, size, and MD5 checksum'
 $validation = Test-MigrationCompleteness -Source $sourceInventory `
                                          -Destination $destInventoryAfter
 Write-Host ('Comparing {0} source blob(s) against {1} destination blob(s)...' -f $validation.SourceCount, $validation.DestCount)
@@ -484,7 +484,7 @@ $elapsedText = if ($elapsed.TotalDays -ge 1) {
     '{0:hh\:mm\:ss}' -f $elapsed
 }
 
-Write-Log 'MIGRATION TIME'
+Write-Log 'MIGRATION TIME -- total elapsed duration for this run'
 Write-Host ('Migration started:  {0:yyyy-MM-dd HH:mm:ss} UTC' -f $migrationStart)
 Write-Host ('Migration ended:    {0:yyyy-MM-dd HH:mm:ss} UTC' -f $migrationEnd)
 Write-Host ('Total time elapsed: {0}' -f $elapsedText)
