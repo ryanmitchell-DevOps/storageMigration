@@ -282,43 +282,54 @@ function Compare-Migration {
     }
 }
 
-function Invoke-AzCopySync {
+function Invoke-AzCopyByList {
     param(
         [string]$SourceAccount,
         [string]$SourceContainer,
         [string]$DestAccount,
-        [string]$DestContainer
+        [string]$DestContainer,
+        [string[]]$BlobNames
     )
+    # Uses `azcopy copy --list-of-files` instead of `azcopy sync`. Sync has no
+    # clean way to exclude specific blob names from being overwritten, so we
+    # do our own comparison up front and explicitly list which blobs to copy.
+    # This lets us preserve destination versions of any blob that has diverged
+    # from source (size or MD5 mismatch) -- those are reported separately as
+    # failures rather than silently overwritten.
+    #
+    # --put-md5 stamps Content-MD5 on the destination so post-migration
+    # validation has a checksum to compare against.
+    if ($BlobNames.Count -eq 0) { return }
+
     $sourceUrl = "https://$SourceAccount.blob.core.windows.net/$SourceContainer"
     $destUrl = "https://$DestAccount.blob.core.windows.net/$DestContainer"
 
-    # --compare-hash=MD5 forces sync to compare by Content-MD5 instead of the
-    # default last-modified-time. Without this, a same-size/same-LMT but corrupted
-    # blob is silently skipped and only surfaces later as an MD5 mismatch in our
-    # post-validation -- confusing to diagnose. --put-md5 stamps the computed
-    # hash on the destination so our post-migration validation has something to
-    # compare against.
-    #
-    # Note: source blobs without an existing Content-MD5 will cause sync to
-    # error on older AzCopy versions. Post-validation catches corruption either
-    # way; --compare-hash just shifts detection earlier (during copy) rather
-    # than later (during our checksum compare).
-    $azArgs = @(
-        'sync', $sourceUrl, $destUrl,
-        '--recursive=true',
-        '--delete-destination=false',
-        '--compare-hash=MD5',
-        '--put-md5'
-    )
+    $listFile = Join-Path ([IO.Path]::GetTempPath()) ("azcopy-list-" + [guid]::NewGuid().ToString() + ".txt")
+    try {
+        # WriteAllLines emits UTF-8 without BOM, newline-separated -- the format
+        # azcopy expects. Avoid Set-Content here: in Windows PowerShell it
+        # defaults to UTF-16 with BOM, which azcopy treats as a single garbled
+        # filename.
+        [System.IO.File]::WriteAllLines($listFile, $BlobNames)
 
-    # Capture combined stdout+stderr so we can dump it on failure -- without
-    # this, AzCopy's actual error reason is invisible in the pipeline log and
-    # we only see our own generic "exit code N" message. Full raw output is
-    # also preserved in $env:AZCOPY_LOG_LOCATION.
-    $output = & azcopy @azArgs 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        $output | ForEach-Object { Write-Host $_ }
-        throw "AzCopy sync failed with exit code $LASTEXITCODE. See logs in $env:AZCOPY_LOG_LOCATION"
+        $azArgs = @(
+            'copy', $sourceUrl, $destUrl,
+            '--list-of-files', $listFile,
+            '--put-md5'
+        )
+
+        # Capture combined stdout+stderr so we can dump it on failure -- without
+        # this, AzCopy's actual error reason is invisible in the pipeline log and
+        # we only see our own generic "exit code N" message. Full raw output is
+        # also preserved in $env:AZCOPY_LOG_LOCATION.
+        $output = & azcopy @azArgs 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            $output | ForEach-Object { Write-Host $_ }
+            throw "AzCopy copy failed with exit code $LASTEXITCODE. See logs in $env:AZCOPY_LOG_LOCATION"
+        }
+    }
+    finally {
+        if (Test-Path $listFile) { Remove-Item $listFile -Force -ErrorAction SilentlyContinue }
     }
 }
 
@@ -435,7 +446,7 @@ $env:AZCOPY_LOG_LOCATION = $logDir
 $env:AZCOPY_JOB_PLAN_LOCATION = $logDir
 
 # Verify the azcopy binary is reachable before doing any work. Without this,
-# a missing executable surfaces deep inside Invoke-AzCopySync as a generic
+# a missing executable surfaces deep inside Invoke-AzCopyByList as a generic
 # PowerShell "command not found" with no clear remediation.
 if (-not (Get-Command azcopy -ErrorAction SilentlyContinue)) {
     throw "azcopy executable not found in PATH. Install it on the agent (e.g. via the AzureCLI@2 task or a dedicated AzCopy install step) before running this script."
@@ -518,18 +529,19 @@ if ($preStatus.PendingCount -eq 0) {
     return
 }
 
-# Abort before sync if the destination contains files that differ from source.
-# Sync would otherwise silently overwrite them. "Missing in destination" is
-# legitimate work; "destination has a different version" is suspicious -- it
-# means something modified the destination outside this migration (manual edit,
-# interrupted prior run, a different process writing to the same container).
-# Force a human to investigate before we destroy the diverged data.
-$divergedCount = $preStatus.SizeMismatchNames.Count + $preStatus.Md5MismatchNames.Count
-if ($divergedCount -gt 0) {
-    Write-Log ('DESTINATION DIVERGENCE DETECTED -- aborting before sync')
-    Write-Host ("$($script:Ansi.Red){0} blob(s) in '{1}' differ from source by size or MD5.$($script:Ansi.Reset)" -f $divergedCount, $DestContainer)
-    Write-Host ('This means the destination was modified outside of this migration.')
-    Write-Host ('Running sync would overwrite the diverged version(s). Investigate before re-running.')
+# Diverged blobs (size or MD5 mismatch) are NOT copied -- the destination's
+# version stays untouched. They mean something modified the destination outside
+# this migration (manual edit, interrupted prior run, a different process
+# writing to the same container). Report them up front so the operator knows
+# what's being preserved; the script will still fail at the end with these
+# listed as skipped, but only after copying the safe (missing-in-destination)
+# blobs.
+$divergedNames = @($preStatus.SizeMismatchNames) + @($preStatus.Md5MismatchNames)
+if ($divergedNames.Count -gt 0) {
+    Write-Log ('DESTINATION DIVERGENCE DETECTED -- these blobs will NOT be copied')
+    Write-Host ("$($script:Ansi.Red){0} blob(s) in '{1}' differ from source by size or MD5.$($script:Ansi.Reset)" -f $divergedNames.Count, $DestContainer)
+    Write-Host ('The destination versions will be preserved (NOT overwritten). Missing-in-destination')
+    Write-Host ('blobs will still be copied; the script will fail at the end with these listed.')
     Write-Host ''
     if ($preStatus.SizeMismatchNames.Count -gt 0) {
         Write-Host ('  Size mismatch ({0}):' -f $preStatus.SizeMismatchNames.Count)
@@ -545,32 +557,47 @@ if ($divergedCount -gt 0) {
             Write-Host ("    $($script:Ansi.Yellow){0,-50}$($script:Ansi.Reset)  source-md5={1}  dest-md5={2}" -f (Format-Cell $_ 50), $sourceInventory[$_].MD5, $destInventoryBefore[$_].MD5)
         }
     }
-    throw "Destination divergence detected: $divergedCount blob(s) differ from source. Aborting before sync overwrites the destination's version."
 }
+
+# Safe-to-copy set: pending blobs that aren't diverged. These are the ones
+# missing from destination -- copying them is purely additive and can't destroy
+# any existing destination state.
+$divergedSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+foreach ($n in $divergedNames) { [void]$divergedSet.Add($n) }
+$toCopy = @($preStatus.PendingNames | Where-Object { -not $divergedSet.Contains($_) })
 
 # Migration
 # Declared outside ShouldProcess so the later `if ($azCopyError)` check is safe
 # under Set-StrictMode even if the early-return paths are ever refactored.
 $azCopyError = $null
-if ($PSCmdlet.ShouldProcess(
-    "$($preStatus.PendingCount) blob(s) pending",
+if ($toCopy.Count -eq 0) {
+    Write-Log ('NOTHING TO COPY -- all {0} pending blob(s) are diverged in destination and will be preserved' -f $divergedNames.Count)
+}
+elseif ($PSCmdlet.ShouldProcess(
+    "$($toCopy.Count) blob(s) to copy ($($divergedNames.Count) diverged, preserved)",
     "Copy to $DestStorageAccount/$DestContainer")) {
 
-    Write-Log ('MIGRATING -- copying {0} pending blob(s) from {1} to {2}' -f $preStatus.PendingCount, $SourceContainer, $DestContainer)
+    $migrateLabel = if ($divergedNames.Count -gt 0) {
+        ('MIGRATING -- copying {0} missing blob(s) from {1} to {2} ({3} diverged blob(s) preserved in destination)' -f $toCopy.Count, $SourceContainer, $DestContainer, $divergedNames.Count)
+    } else {
+        ('MIGRATING -- copying {0} pending blob(s) from {1} to {2}' -f $toCopy.Count, $SourceContainer, $DestContainer)
+    }
+    Write-Log $migrateLabel
     [long]$migrationTotalSize = 0
-    $preStatus.PendingNames | Sort-Object | ForEach-Object {
+    $toCopy | Sort-Object | ForEach-Object {
         $size = $sourceInventory[$_].Length
         $migrationTotalSize += $size
         Write-Host ('  {0,-50} {1,-10} {2,10}' -f (Format-Cell $_ 50), $sourceInventory[$_].BlobType, (Format-FileSize $size))
     }
     Write-Host ''
-    Write-Host ('  Total: {0} file(s), {1}' -f $preStatus.PendingCount, (Format-FileSize $migrationTotalSize))
+    Write-Host ('  Total: {0} file(s), {1}' -f $toCopy.Count, (Format-FileSize $migrationTotalSize))
 
     try {
-        Invoke-AzCopySync -SourceAccount $SourceStorageAccount `
-                          -SourceContainer $SourceContainer `
-                          -DestAccount $DestStorageAccount `
-                          -DestContainer $DestContainer
+        Invoke-AzCopyByList -SourceAccount $SourceStorageAccount `
+                            -SourceContainer $SourceContainer `
+                            -DestAccount $DestStorageAccount `
+                            -DestContainer $DestContainer `
+                            -BlobNames $toCopy
     }
     catch {
         $azCopyError = $_
@@ -590,39 +617,54 @@ else {
 $destInventoryAfter = Get-BlobInventory -Context $destCtx -Container $DestContainer
 $validation = Test-MigrationCompleteness -Source $sourceInventory -Destination $destInventoryAfter
 
-# Scope $failed to blobs we actually tried to transfer (pending set). A blob
-# that was matched at pre-time but mismatched at post-time means source mutated
-# during the run -- reported by validation but not counted as a transfer failure.
-$pendingSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
-foreach ($n in $preStatus.PendingNames) { [void]$pendingSet.Add($n) }
+# Scope $failed to blobs we actually tried to copy ($toCopy). Diverged blobs
+# weren't part of the copy operation -- they're tracked separately as $skipped.
+# A blob that was matched at pre-time but mismatched at post-time means source
+# mutated during the run -- reported by validation but not counted as a
+# transfer failure.
+$toCopySet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+foreach ($n in $toCopy) { [void]$toCopySet.Add($n) }
 
 $failed = New-Object System.Collections.Generic.List[string]
-foreach ($n in $validation.MissingNames)      { if ($pendingSet.Contains($n)) { $failed.Add($n) } }
-foreach ($n in $validation.SizeMismatchNames) { if ($pendingSet.Contains($n)) { $failed.Add($n) } }
-foreach ($n in $validation.Md5MismatchNames)  { if ($pendingSet.Contains($n)) { $failed.Add($n) } }
+foreach ($n in $validation.MissingNames)      { if ($toCopySet.Contains($n)) { $failed.Add($n) } }
+foreach ($n in $validation.SizeMismatchNames) { if ($toCopySet.Contains($n)) { $failed.Add($n) } }
+foreach ($n in $validation.Md5MismatchNames)  { if ($toCopySet.Contains($n)) { $failed.Add($n) } }
 
 $failedSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
 foreach ($n in $failed) { [void]$failedSet.Add($n) }
-$succeeded = @($preStatus.PendingNames | Where-Object { -not $failedSet.Contains($_) })
+$succeeded = @($toCopy | Where-Object { -not $failedSet.Contains($_) })
+$skipped = $divergedNames
 
 if ($succeeded.Count -gt 0) {
     Write-Log 'SUCCESSFULLY TRANSFERRED'
     if ($failed.Count -eq 0) {
-        Write-Host ('  All {0} pending blob(s) transferred successfully.' -f $succeeded.Count)
+        Write-Host ('  All {0} copied blob(s) transferred successfully.' -f $succeeded.Count)
     } else {
-        Write-Host ('  {0} of {1} pending blob(s) transferred successfully.' -f $succeeded.Count, $preStatus.PendingCount)
+        Write-Host ('  {0} of {1} blob(s) transferred successfully.' -f $succeeded.Count, $toCopy.Count)
         Show-BlobList -Heading ("Transferred to $DestContainer") -Names $succeeded -SizeSource $sourceInventory
     }
 }
 
 if ($failed.Count -gt 0) {
     Write-Log 'FAILED FILES'
-    Write-Host ("  $($script:Ansi.Red){0} blob(s) were pending but did not reach the destination intact.$($script:Ansi.Reset)" -f $failed.Count)
+    Write-Host ("  $($script:Ansi.Red){0} blob(s) were copied but did not reach the destination intact.$($script:Ansi.Reset)" -f $failed.Count)
     Write-Host ('  See AzCopy logs in {0}' -f $logDir)
     Write-Host ''
     $failed | Sort-Object | ForEach-Object {
         $size = $sourceInventory[$_].Length
         Write-Host ("  $($script:Ansi.Red){0,-50}$($script:Ansi.Reset) {1,-10} {2,10}" -f (Format-Cell $_ 50), $sourceInventory[$_].BlobType, (Format-FileSize $size))
+    }
+}
+
+if ($skipped.Count -gt 0) {
+    Write-Log 'SKIPPED FILES (destination divergence)'
+    Write-Host ("  $($script:Ansi.Red){0} blob(s) were preserved in destination because they diverge from source.$($script:Ansi.Reset)" -f $skipped.Count)
+    Write-Host ('  These were NOT overwritten. Investigate and reconcile manually before re-running.')
+    Write-Host ''
+    $skipped | Sort-Object | ForEach-Object {
+        $srcSize = $sourceInventory[$_].Length
+        $dstSize = $destInventoryBefore[$_].Length
+        Write-Host ("  $($script:Ansi.Yellow){0,-50}$($script:Ansi.Reset) {1,-10}  source={2,10}  dest={3,10}" -f (Format-Cell $_ 50), $sourceInventory[$_].BlobType, (Format-FileSize $srcSize), (Format-FileSize $dstSize))
     }
 }
 
@@ -672,10 +714,12 @@ Write-Host ('Already in sync:     {0}' -f $preStatus.AlreadyInSyncNames.Count)
 Write-Host ('Pending:             {0}' -f $preStatus.PendingCount)
 Write-Host ('  Migrated:          {0}' -f $succeeded.Count)
 Write-Host ('  Failed:            {0}' -f $failed.Count)
+Write-Host ('  Skipped (diverged):{0}' -f $skipped.Count)
 if ($validation.DestOnlyCount -gt 0) {
     Write-Host ('Destination extras:  {0} (preserved, not in source)' -f $validation.DestOnlyCount)
 }
-$validationStatus = if ($validation.Passed) {
+$overallPass = $validation.Passed -and $skipped.Count -eq 0
+$validationStatus = if ($overallPass) {
     'PASS'
 } else {
     "$($script:Ansi.Red)FAIL$($script:Ansi.Reset)"
@@ -688,6 +732,9 @@ Write-Host ("Validation:          {0}" -f $validationStatus)
 # whether these throws fire or an earlier error/early-return ended the run.
 if ($azCopyError) {
     throw $azCopyError.Exception
+}
+if ($skipped.Count -gt 0) {
+    throw "Destination divergence: $($skipped.Count) blob(s) in '$DestContainer' differ from source and were preserved (not overwritten). Reconcile manually before re-running. See SKIPPED FILES above for the list."
 }
 if (-not $validation.Passed) {
     throw "Validation failed:`n$($validation.Issues -join "`n")"
