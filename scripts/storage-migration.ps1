@@ -113,6 +113,51 @@ function Get-BlobInventory {
     return $map
 }
 
+function Get-RemoteBlobMD5 {
+    param(
+        [Parameter(Mandatory)]$Context,
+        [Parameter(Mandatory)][string]$Container,
+        [Parameter(Mandatory)][string]$BlobName
+    )
+    # Backfill helper -- downloads a blob to a temp file and computes MD5 so we
+    # have a real checksum when Content-MD5 metadata is missing. Returns the
+    # hash as base64 to match the format Azure stores in Content-MD5.
+    $tempPath = Join-Path ([IO.Path]::GetTempPath()) ("blobcheck_" + [guid]::NewGuid().ToString() + ".bin")
+    try {
+        Get-AzStorageBlobContent -Container $Container -Blob $BlobName -Destination $tempPath -Context $Context -Force -ErrorAction Stop | Out-Null
+        $hashHex = (Get-FileHash -Path $tempPath -Algorithm MD5).Hash
+        $bytes = [byte[]]::new($hashHex.Length / 2)
+        for ($i = 0; $i -lt $bytes.Length; $i++) {
+            $bytes[$i] = [Convert]::ToByte($hashHex.Substring($i * 2, 2), 16)
+        }
+        return [Convert]::ToBase64String($bytes)
+    }
+    finally {
+        if (Test-Path $tempPath) { Remove-Item $tempPath -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+function Update-InventoryMissingMd5 {
+    param(
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Inventory,
+        [Parameter(Mandatory)]$Context,
+        [Parameter(Mandatory)][string]$Container,
+        [Parameter(Mandatory)][string[]]$Names
+    )
+    # Mutates inventory entries in place: for each named blob whose MD5 is
+    # currently null, hash the content and store the result. Returns the
+    # number of MD5s resolved so the caller can report progress.
+    $resolved = 0
+    foreach ($name in $Names) {
+        if (-not $Inventory.ContainsKey($name)) { continue }
+        $entry = $Inventory[$name]
+        if ($entry.MD5) { continue }
+        $entry.MD5 = Get-RemoteBlobMD5 -Context $Context -Container $Container -BlobName $name
+        $resolved++
+    }
+    return $resolved
+}
+
 function Show-BlobList {
     param(
         [string]$Heading,
@@ -438,6 +483,30 @@ $destInventoryBefore = Get-BlobInventory -Context $destCtx -Container $DestConta
 Write-Host ('       Source inventoried:      {0} blob(s)' -f $sourceInventory.Count)
 Write-Host ('       Destination inventoried: {0} blob(s)' -f $destInventoryBefore.Count)
 
+# Backfill MD5 by hashing content for blobs where size matches on both sides
+# but at least one side lacks Content-MD5 metadata. Without this, those blobs
+# fall into the "noMd5" classification and are silently treated as in-sync --
+# meaning a destination modification that happens to land at the same byte
+# count as source would go undetected. Only same-size candidates get hashed:
+# size differences are already conclusive evidence of divergence, no need to
+# pay the download cost to confirm.
+$md5Candidates = New-Object System.Collections.Generic.List[string]
+foreach ($name in $sourceInventory.Keys) {
+    if (-not $destInventoryBefore.ContainsKey($name)) { continue }
+    $s = $sourceInventory[$name]
+    $d = $destInventoryBefore[$name]
+    if ($s.Length -ne $d.Length) { continue }
+    if (-not $s.MD5 -or -not $d.MD5) { $md5Candidates.Add($name) }
+}
+if ($md5Candidates.Count -gt 0) {
+    Write-Host ('       {0} same-size blob(s) lack Content-MD5 metadata. Hashing content to verify...' -f $md5Candidates.Count)
+    $null = Set-AzContext -SubscriptionId $SourceSubscriptionId -WarningAction SilentlyContinue
+    $srcResolved = Update-InventoryMissingMd5 -Inventory $sourceInventory -Context $sourceCtx -Container $SourceContainer -Names $md5Candidates
+    $null = Set-AzContext -SubscriptionId $DestSubscriptionId -WarningAction SilentlyContinue
+    $dstResolved = Update-InventoryMissingMd5 -Inventory $destInventoryBefore -Context $destCtx -Container $DestContainer -Names $md5Candidates
+    Write-Host ('       MD5 backfilled: {0} source blob(s), {1} destination blob(s).' -f $srcResolved, $dstResolved)
+}
+
 $preStatus = Compare-Migration -Source $sourceInventory `
                                   -Destination $destInventoryBefore `
                                   -SourceContainer $SourceContainer `
@@ -447,6 +516,36 @@ $preStatus = Compare-Migration -Source $sourceInventory `
 if ($preStatus.PendingCount -eq 0) {
     Write-Log 'Nothing to migrate -- destination already in sync.'
     return
+}
+
+# Abort before sync if the destination contains files that differ from source.
+# Sync would otherwise silently overwrite them. "Missing in destination" is
+# legitimate work; "destination has a different version" is suspicious -- it
+# means something modified the destination outside this migration (manual edit,
+# interrupted prior run, a different process writing to the same container).
+# Force a human to investigate before we destroy the diverged data.
+$divergedCount = $preStatus.SizeMismatchNames.Count + $preStatus.Md5MismatchNames.Count
+if ($divergedCount -gt 0) {
+    Write-Log ('DESTINATION DIVERGENCE DETECTED -- aborting before sync')
+    Write-Host ("$($script:Ansi.Red){0} blob(s) in '{1}' differ from source by size or MD5.$($script:Ansi.Reset)" -f $divergedCount, $DestContainer)
+    Write-Host ('This means the destination was modified outside of this migration.')
+    Write-Host ('Running sync would overwrite the diverged version(s). Investigate before re-running.')
+    Write-Host ''
+    if ($preStatus.SizeMismatchNames.Count -gt 0) {
+        Write-Host ('  Size mismatch ({0}):' -f $preStatus.SizeMismatchNames.Count)
+        $preStatus.SizeMismatchNames | Sort-Object | ForEach-Object {
+            $srcSize = $sourceInventory[$_].Length
+            $dstSize = $destInventoryBefore[$_].Length
+            Write-Host ("    $($script:Ansi.Yellow){0,-50}$($script:Ansi.Reset)  source={1}  dest={2}" -f (Format-Cell $_ 50), (Format-FileSize $srcSize), (Format-FileSize $dstSize))
+        }
+    }
+    if ($preStatus.Md5MismatchNames.Count -gt 0) {
+        Write-Host ('  MD5 mismatch ({0}):' -f $preStatus.Md5MismatchNames.Count)
+        $preStatus.Md5MismatchNames | Sort-Object | ForEach-Object {
+            Write-Host ("    $($script:Ansi.Yellow){0,-50}$($script:Ansi.Reset)  source-md5={1}  dest-md5={2}" -f (Format-Cell $_ 50), $sourceInventory[$_].MD5, $destInventoryBefore[$_].MD5)
+        }
+    }
+    throw "Destination divergence detected: $divergedCount blob(s) differ from source. Aborting before sync overwrites the destination's version."
 }
 
 # Migration
