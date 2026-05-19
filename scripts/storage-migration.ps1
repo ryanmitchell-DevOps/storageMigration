@@ -145,15 +145,33 @@ function Update-InventoryMissingMd5 {
         [Parameter(Mandatory)][string[]]$Names
     )
     # Mutates inventory entries in place: for each named blob whose MD5 is
-    # currently null, hash the content and store the result. Returns the
-    # number of MD5s resolved so the caller can report progress.
+    # currently null, hash the content and store the result. Per-blob failures
+    # (transient network errors, blob deleted between inventory and download,
+    # permission gaps) are caught and logged so a single bad blob can't kill
+    # the whole migration -- the affected entries keep MD5=null and fall back
+    # to the existing size-only / noMd5 path, which is the same behavior we'd
+    # get if Content-MD5 metadata was simply absent. Returns the number of
+    # MD5s successfully resolved.
     $resolved = 0
+    $failures = New-Object System.Collections.Generic.List[string]
     foreach ($name in $Names) {
         if (-not $Inventory.ContainsKey($name)) { continue }
         $entry = $Inventory[$name]
         if ($entry.MD5) { continue }
-        $entry.MD5 = Get-RemoteBlobMD5 -Context $Context -Container $Container -BlobName $name
-        $resolved++
+        try {
+            $entry.MD5 = Get-RemoteBlobMD5 -Context $Context -Container $Container -BlobName $name
+            $resolved++
+        }
+        catch {
+            $failures.Add("$name -- $($_.Exception.Message)")
+        }
+    }
+    if ($failures.Count -gt 0) {
+        Write-Warning ("MD5 backfill failed for {0} blob(s); they will fall back to size-only comparison:" -f $failures.Count)
+        $failures | Select-Object -First 10 | ForEach-Object { Write-Warning "  $_" }
+        if ($failures.Count -gt 10) {
+            Write-Warning ("  ... and {0} more (see {1} for full AzCopy logs if related)" -f ($failures.Count - 10), $env:AZCOPY_LOG_LOCATION)
+        }
     }
     return $resolved
 }
@@ -312,6 +330,9 @@ function Invoke-AzCopyByList {
         # filename.
         [System.IO.File]::WriteAllLines($listFile, $BlobNames)
 
+        # No --recursive flag: --list-of-files specifies exact blob paths, so
+        # recursion is meaningless. azcopy treats each line as a single blob
+        # relative to the source URL.
         $azArgs = @(
             'copy', $sourceUrl, $destUrl,
             '--list-of-files', $listFile,
@@ -538,10 +559,11 @@ if ($preStatus.PendingCount -eq 0) {
 # blobs.
 $divergedNames = @($preStatus.SizeMismatchNames) + @($preStatus.Md5MismatchNames)
 if ($divergedNames.Count -gt 0) {
-    Write-Log ('DESTINATION DIVERGENCE DETECTED -- these blobs will NOT be copied')
+    Write-Log ('DESTINATION DIVERGENCE DETECTED -- these blobs will NOT be copied, pipeline WILL fail')
     Write-Host ("$($script:Ansi.Red){0} blob(s) in '{1}' differ from source by size or MD5.$($script:Ansi.Reset)" -f $divergedNames.Count, $DestContainer)
     Write-Host ('The destination versions will be preserved (NOT overwritten). Missing-in-destination')
-    Write-Host ('blobs will still be copied; the script will fail at the end with these listed.')
+    Write-Host ('blobs will still be copied below, but the pipeline will FAIL at the end with these')
+    Write-Host ('blobs listed. Reconcile manually and re-run to clear the divergence.')
     Write-Host ''
     if ($preStatus.SizeMismatchNames.Count -gt 0) {
         Write-Host ('  Size mismatch ({0}):' -f $preStatus.SizeMismatchNames.Count)
@@ -657,9 +679,10 @@ if ($failed.Count -gt 0) {
 }
 
 if ($skipped.Count -gt 0) {
-    Write-Log 'SKIPPED FILES (destination divergence)'
+    Write-Log 'SKIPPED FILES (destination divergence -- pipeline will FAIL)'
     Write-Host ("  $($script:Ansi.Red){0} blob(s) were preserved in destination because they diverge from source.$($script:Ansi.Reset)" -f $skipped.Count)
-    Write-Host ('  These were NOT overwritten. Investigate and reconcile manually before re-running.')
+    Write-Host ('  These were NOT overwritten. The pipeline will fail below.')
+    Write-Host ('  Reconcile manually (delete the diverged dest blob or fix the source) and re-run.')
     Write-Host ''
     $skipped | Sort-Object | ForEach-Object {
         $srcSize = $sourceInventory[$_].Length
@@ -681,7 +704,7 @@ $null = Compare-Migration -Source $sourceInventory `
 Write-Log ("VALIDATION -- comparing '{0}' to '{1}' by name, size, and MD5 checksum" -f $SourceContainer, $DestContainer)
 Write-Host ("Comparing {0} blob(s) in '{1}' against {2} blob(s) in '{3}'..." -f $validation.SourceCount, $SourceContainer, $validation.DestCount, $DestContainer)
 if ($validation.DestOnlyCount -gt 0) {
-    Write-Host ('Note: destination contains {0} blob(s) not present in source (preserved by --delete-destination=false).' -f $validation.DestOnlyCount)
+    Write-Host ('Note: destination contains {0} blob(s) not present in source (preserved -- only blobs listed in $toCopy are copied).' -f $validation.DestOnlyCount)
     Show-BlobList -Heading ("Only in $DestContainer") -Names $validation.DestOnlyNames -SizeSource $destInventoryAfter
 }
 Write-Host ''
@@ -714,7 +737,7 @@ Write-Host ('Already in sync:     {0}' -f $preStatus.AlreadyInSyncNames.Count)
 Write-Host ('Pending:             {0}' -f $preStatus.PendingCount)
 Write-Host ('  Migrated:          {0}' -f $succeeded.Count)
 Write-Host ('  Failed:            {0}' -f $failed.Count)
-Write-Host ('  Skipped (diverged):{0}' -f $skipped.Count)
+Write-Host ('  Skipped (diverged): {0}' -f $skipped.Count)
 if ($validation.DestOnlyCount -gt 0) {
     Write-Host ('Destination extras:  {0} (preserved, not in source)' -f $validation.DestOnlyCount)
 }
