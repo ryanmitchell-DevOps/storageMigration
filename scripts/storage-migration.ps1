@@ -249,18 +249,20 @@ function Invoke-AzCopySync {
 
     # --compare-hash=MD5 forces sync to compare by Content-MD5 instead of the
     # default last-modified-time. Without this, a same-size/same-LMT but corrupted
-    # blob is silently skipped and only surfaces later as an MD5 mismatch in
-    # validation -- confusing to diagnose. --missing-hash-policy=Generate lets
-    # azcopy compute MD5 on the fly for source blobs that lack Content-MD5, so
-    # the comparison still works on legacy data. --put-md5 stamps the computed
+    # blob is silently skipped and only surfaces later as an MD5 mismatch in our
+    # post-validation -- confusing to diagnose. --put-md5 stamps the computed
     # hash on the destination so our post-migration validation has something to
     # compare against.
+    #
+    # Note: source blobs without an existing Content-MD5 will cause sync to
+    # error on older AzCopy versions. Post-validation catches corruption either
+    # way; --compare-hash just shifts detection earlier (during copy) rather
+    # than later (during our checksum compare).
     $azArgs = @(
         'sync', $sourceUrl, $destUrl,
         '--recursive=true',
         '--delete-destination=false',
         '--compare-hash=MD5',
-        '--missing-hash-policy=Generate',
         '--put-md5'
     )
 
