@@ -1,5 +1,5 @@
 #Requires -Version 7.0
-#Requires -Modules Az.Accounts, Az.Storage
+#Requires -Modules Az.Accounts, @{ ModuleName='Az.Storage'; ModuleVersion='6.0.0' }
 
 [CmdletBinding(SupportsShouldProcess)]
 param(
@@ -21,8 +21,9 @@ $ProgressPreference = 'SilentlyContinue'
 # headings rely on Azure DevOps's ##[section] marker instead of ANSI so they
 # render correctly in artifact viewers / plain-text downloads.
 $script:Ansi = @{
-    Reset = "`e[0m"
-    Red   = "`e[91m"
+    Reset  = "`e[0m"
+    Red    = "`e[91m"
+    Yellow = "`e[93m"
 }
 
 # Functions
@@ -214,8 +215,8 @@ function Compare-Migration {
         $pending.Count, $pendingPct, $c.MissingNames.Count, $c.SizeMismatchNames.Count, $c.Md5MismatchNames.Count)
 
     Show-BlobList -Heading ("Not in $DestContainer")     -Names $c.MissingNames      -SizeSource $Source -Color $script:Ansi.Red
-    Show-BlobList -Heading 'Out of sync (size differs)'  -Names $c.SizeMismatchNames -SizeSource $Source
-    Show-BlobList -Heading 'Out of sync (MD5 differs)'   -Names $c.Md5MismatchNames  -SizeSource $Source
+    Show-BlobList -Heading 'Out of sync (size differs)'  -Names $c.SizeMismatchNames -SizeSource $Source -Color $script:Ansi.Yellow
+    Show-BlobList -Heading 'Out of sync (MD5 differs)'   -Names $c.Md5MismatchNames  -SizeSource $Source -Color $script:Ansi.Yellow
     Show-BlobList -Heading ("Already in $DestContainer") -Names $alreadyInSync       -SizeSource $Source
 
     return [pscustomobject]@{
@@ -226,9 +227,13 @@ function Compare-Migration {
         PendingNames      = $pending
         MissingNames      = $c.MissingNames
         OutOfSyncNames    = $outOfSync
-        SizeMismatchNames = $c.SizeMismatchNames
-        Md5MismatchNames  = $c.Md5MismatchNames
-        MatchedNames      = $alreadyInSync
+        SizeMismatchNames  = $c.SizeMismatchNames
+        Md5MismatchNames   = $c.Md5MismatchNames
+        # Includes both MD5-verified matches AND blobs where neither side has a
+        # Content-MD5 set (size matched but checksum couldn't be confirmed).
+        # Callers that need verified-only matches should use Get-BlobClassification
+        # directly and read .MatchedNames.
+        AlreadyInSyncNames = $alreadyInSync
     }
 }
 
@@ -242,10 +247,20 @@ function Invoke-AzCopySync {
     $sourceUrl = "https://$SourceAccount.blob.core.windows.net/$SourceContainer"
     $destUrl = "https://$DestAccount.blob.core.windows.net/$DestContainer"
 
+    # --compare-hash=MD5 forces sync to compare by Content-MD5 instead of the
+    # default last-modified-time. Without this, a same-size/same-LMT but corrupted
+    # blob is silently skipped and only surfaces later as an MD5 mismatch in
+    # validation -- confusing to diagnose. --missing-hash-policy=Generate lets
+    # azcopy compute MD5 on the fly for source blobs that lack Content-MD5, so
+    # the comparison still works on legacy data. --put-md5 stamps the computed
+    # hash on the destination so our post-migration validation has something to
+    # compare against.
     $azArgs = @(
         'sync', $sourceUrl, $destUrl,
         '--recursive=true',
         '--delete-destination=false',
+        '--compare-hash=MD5',
+        '--missing-hash-policy=Generate',
         '--put-md5'
     )
 
@@ -371,6 +386,13 @@ $logDir = Initialize-LogDirectory -Log $LogDirectory
 $env:AZCOPY_AUTO_LOGIN_TYPE = 'PSCRED'
 $env:AZCOPY_LOG_LOCATION = $logDir
 $env:AZCOPY_JOB_PLAN_LOCATION = $logDir
+
+# Verify the azcopy binary is reachable before doing any work. Without this,
+# a missing executable surfaces deep inside Invoke-AzCopySync as a generic
+# PowerShell "command not found" with no clear remediation.
+if (-not (Get-Command azcopy -ErrorAction SilentlyContinue)) {
+    throw "azcopy executable not found in PATH. Install it on the agent (e.g. via the AzureCLI@2 task or a dedicated AzCopy install step) before running this script."
+}
 
 # All work is wrapped so the MIGRATION TIME block always fires, including on
 # early returns ("nothing to migrate", -WhatIf) and on uncaught exceptions.
@@ -545,7 +567,7 @@ else {
 
 Write-Log 'SUMMARY -- migration result'
 Write-Host ('Source blobs:        {0}' -f $sourceInventory.Count)
-Write-Host ('Already in sync:     {0}' -f $preStatus.MatchedNames.Count)
+Write-Host ('Already in sync:     {0}' -f $preStatus.AlreadyInSyncNames.Count)
 Write-Host ('Pending:             {0}' -f $preStatus.PendingCount)
 Write-Host ('  Migrated:          {0}' -f $succeeded.Count)
 Write-Host ('  Failed:            {0}' -f $failed.Count)
