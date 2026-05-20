@@ -305,15 +305,13 @@ function Invoke-AzCopyByList {
     try {
         [System.IO.File]::WriteAllLines($listFile, $BlobNames)
 
-        $azArgs = @(
-            'copy', $sourceUrl, $destUrl,
-            '--list-of-files', $listFile,
-            '--put-md5'
-        )
+        & azcopy copy $sourceUrl $destUrl `
+             --list-of-files $listFile `
+             --put-md5 2>&1 | ForEach-Object { Write-Host $_ }
 
-        if ($LASTEXITCODE -ne 0) {
-            $output | ForEach-Object { Write-Host $_ }
-            throw "AzCopy copy failed with exit code $LASTEXITCODE. See logs in $env:AZCOPY_LOG_LOCATION"
+        $exit = $LASTEXITCODE
+        if ($exit -ne 0) {
+            throw "AzCopy copy failed with exit code $exit. See logs in $env:AZCOPY_LOG_LOCATION"
         }
     }
     finally {
@@ -434,6 +432,8 @@ $env:AZCOPY_JOB_PLAN_LOCATION = $logDir
 if (-not (Get-Command azcopy -ErrorAction SilentlyContinue)) {
     throw "azcopy executable not found in PATH. Install it on the agent (e.g. via the AzureCLI@2 task or a dedicated AzCopy install step) before running this script."
 }
+
+try {
 
 Write-Log 'MIGRATION CONFIGURATION -- source and destination details for this run'
 Write-Host ('Start time:        {0:yyyy-MM-dd HH:mm:ss} UTC' -f $migrationStart)
@@ -691,6 +691,7 @@ if (-not $validation.Passed) {
     throw "Validation failed:`n$($validation.Issues -join "`n")"
 }
 
+}
 finally {
     $migrationEnd = [datetime]::UtcNow
     $elapsed = $migrationEnd - $migrationStart
