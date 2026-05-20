@@ -17,22 +17,23 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
-# ANSI escapes for the one color we still use (red, for failures). Section
-# headings rely on Azure DevOps's ##[section] marker instead of ANSI so they
-# render correctly in artifact viewers / plain-text downloads.
+# ANSI colour codes — red for failures, yellow for warnings. Section headings use ##[section] instead.
 $script:Ansi = @{
     Reset  = "`e[0m"
     Red    = "`e[91m"
     Yellow = "`e[93m"
 }
 
-# Functions
+# ── FUNCTIONS ─────────────────────────────────────────────────────────────────
+
+# Emits an ADO ##[section] heading with a blank line prefix.
 function Write-Log {
     param([string]$LogMessage)
     Write-Host ''
     Write-Host "##[section]$LogMessage"
 }
 
+# Resolves and creates the AzCopy log directory from -LogDirectory, ADO env var, or a temp path.
 function Initialize-LogDirectory {
     param([string]$Log)
     if ($Log) { $dir = $Log }
@@ -45,6 +46,7 @@ function Initialize-LogDirectory {
     return $dir
 }
 
+# Converts a byte count to a human-readable size string (B / KB / MB / GB).
 function Format-FileSize {
     param([long]$Bytes)
     if ($Bytes -ge 1GB) { return '{0:N2} GB' -f ($Bytes / 1GB) }
@@ -53,19 +55,19 @@ function Format-FileSize {
     return '{0} B' -f $Bytes
 }
 
+# Truncates text to a fixed column width, appending '…' if it overflows.
 function Format-Cell {
     param([string]$Text, [int]$Width)
     if ($Text.Length -gt $Width) { return $Text.Substring(0, $Width - 1) + '…' }
     return $Text
 }
 
+# Throws if the named storage account is not visible in the current subscription.
 function Assert-StorageAccountExists {
     param(
         [Parameter(Mandatory)][string]$AccountName,
         [Parameter(Mandatory)][string]$SubscriptionId
     )
-    # Targeted ARM lookup -- avoids enumerating every storage account in the
-    # subscription (slow + requires broader RBAC than necessary).
     $account = Get-AzResource -ResourceType 'Microsoft.Storage/storageAccounts' -Name $AccountName -ErrorAction SilentlyContinue
     if (-not $account) {
         throw "Storage account '$AccountName' does not exist in subscription '$SubscriptionId', or the current identity does not have access to it."
@@ -73,6 +75,7 @@ function Assert-StorageAccountExists {
     Write-Host ("Storage account '{0}' found in subscription '{1}'." -f $AccountName, $SubscriptionId)
 }
 
+# Throws if the named container does not exist in the given storage context.
 function Assert-ContainerExists {
     param(
         [Parameter(Mandatory)]$Context,
@@ -86,13 +89,12 @@ function Assert-ContainerExists {
     Write-Host ("Container '{0}' found in '{1}'." -f $Container, $AccountName)
 }
 
+# Builds an ordinal (case-sensitive) name → blob metadata dictionary for a container.
 function Get-BlobInventory {
     param(
         [Parameter(Mandatory)]$Context,
         [Parameter(Mandatory)][string]$Container
     )
-    # Case-sensitive: Azure blob names are case-sensitive but PowerShell's default
-    # @{} hashtable is not, which would silently collapse 'File.txt' and 'file.txt'.
     $map = [System.Collections.Generic.Dictionary[string,object]]::new([System.StringComparer]::Ordinal)
     $count = 0
     Get-AzStorageBlob -Container $Container -Context $Context -ErrorAction Stop |
@@ -113,15 +115,13 @@ function Get-BlobInventory {
     return $map
 }
 
+# Downloads a blob to a temp file and returns its MD5 checksum as base64.
 function Get-RemoteBlobMD5 {
     param(
         [Parameter(Mandatory)]$Context,
         [Parameter(Mandatory)][string]$Container,
         [Parameter(Mandatory)][string]$BlobName
     )
-    # Backfill helper -- downloads a blob to a temp file and computes MD5 so we
-    # have a real checksum when Content-MD5 metadata is missing. Returns the
-    # hash as base64 to match the format Azure stores in Content-MD5.
     $tempPath = Join-Path ([IO.Path]::GetTempPath()) ("blobcheck_" + [guid]::NewGuid().ToString() + ".bin")
     try {
         Get-AzStorageBlobContent -Container $Container -Blob $BlobName -Destination $tempPath -Context $Context -Force -ErrorAction Stop | Out-Null
@@ -137,6 +137,7 @@ function Get-RemoteBlobMD5 {
     }
 }
 
+# Backfills MD5 in-place for inventory entries that lack Content-MD5 metadata; warns on failures.
 function Update-InventoryMissingMd5 {
     param(
         [Parameter(Mandatory)][System.Collections.IDictionary]$Inventory,
@@ -144,14 +145,6 @@ function Update-InventoryMissingMd5 {
         [Parameter(Mandatory)][string]$Container,
         [Parameter(Mandatory)][string[]]$Names
     )
-    # Mutates inventory entries in place: for each named blob whose MD5 is
-    # currently null, hash the content and store the result. Per-blob failures
-    # (transient network errors, blob deleted between inventory and download,
-    # permission gaps) are caught and logged so a single bad blob can't kill
-    # the whole migration -- the affected entries keep MD5=null and fall back
-    # to the existing size-only / noMd5 path, which is the same behavior we'd
-    # get if Content-MD5 metadata was simply absent. Returns the number of
-    # MD5s successfully resolved.
     $resolved = 0
     $failures = New-Object System.Collections.Generic.List[string]
     foreach ($name in $Names) {
@@ -176,6 +169,7 @@ function Update-InventoryMissingMd5 {
     return $resolved
 }
 
+# Prints a truncated, sorted blob list with type and size columns.
 function Show-BlobList {
     param(
         [string]$Heading,
@@ -198,10 +192,8 @@ function Show-BlobList {
     if ($Names.Count -gt $shown) { Write-Host "    ... and $($Names.Count - $shown) more" }
 }
 
+# Single pass: buckets every source blob as missing, size-mismatched, MD5-mismatched, noMd5, or matched.
 function Get-BlobClassification {
-    # Single source of truth for how source vs destination blobs are bucketed.
-    # Both Compare-Migration (console reporting) and Test-MigrationCompleteness
-    # (validation) consume this so the rules can't drift.
     param(
         [Parameter(Mandatory)][System.Collections.IDictionary]$Source,
         [Parameter(Mandatory)][System.Collections.IDictionary]$Destination
@@ -248,6 +240,7 @@ function Get-BlobClassification {
     }
 }
 
+# Classifies source vs destination blobs, logs a status table, and returns a status object.
 function Compare-Migration {
     param(
         [System.Collections.IDictionary]$Source,
@@ -258,9 +251,6 @@ function Compare-Migration {
     )
     $c = Get-BlobClassification -Source $Source -Destination $Destination
 
-    # noMd5 blobs (size matches but one side lacks Content-MD5) count as
-    # already-in-sync for pending/migrated math -- there is no checksum to
-    # disprove a content match, so we treat size as sufficient evidence.
     $alreadyInSync = @($c.MatchedNames) + @($c.NoMd5Names)
     $outOfSync = @($c.SizeMismatchNames) + @($c.Md5MismatchNames)
     $pending = @($c.MissingNames) + $outOfSync
@@ -292,14 +282,11 @@ function Compare-Migration {
         OutOfSyncNames    = $outOfSync
         SizeMismatchNames  = $c.SizeMismatchNames
         Md5MismatchNames   = $c.Md5MismatchNames
-        # Includes both MD5-verified matches AND blobs where neither side has a
-        # Content-MD5 set (size matched but checksum couldn't be confirmed).
-        # Callers that need verified-only matches should use Get-BlobClassification
-        # directly and read .MatchedNames.
         AlreadyInSyncNames = $alreadyInSync
     }
 }
 
+# Runs azcopy copy for an explicit blob list; --put-md5 stamps checksums for post-migration validation.
 function Invoke-AzCopyByList {
     param(
         [string]$SourceAccount,
@@ -308,15 +295,7 @@ function Invoke-AzCopyByList {
         [string]$DestContainer,
         [string[]]$BlobNames
     )
-    # Uses `azcopy copy --list-of-files` instead of `azcopy sync`. Sync has no
-    # clean way to exclude specific blob names from being overwritten, so we
-    # do our own comparison up front and explicitly list which blobs to copy.
-    # This lets us preserve destination versions of any blob that has diverged
-    # from source (size or MD5 mismatch) -- those are reported separately as
-    # failures rather than silently overwritten.
-    #
-    # --put-md5 stamps Content-MD5 on the destination so post-migration
-    # validation has a checksum to compare against.
+   
     if ($BlobNames.Count -eq 0) { return }
 
     $sourceUrl = "https://$SourceAccount.blob.core.windows.net/$SourceContainer"
@@ -324,26 +303,14 @@ function Invoke-AzCopyByList {
 
     $listFile = Join-Path ([IO.Path]::GetTempPath()) ("azcopy-list-" + [guid]::NewGuid().ToString() + ".txt")
     try {
-        # WriteAllLines emits UTF-8 without BOM, newline-separated -- the format
-        # azcopy expects. Avoid Set-Content here: in Windows PowerShell it
-        # defaults to UTF-16 with BOM, which azcopy treats as a single garbled
-        # filename.
         [System.IO.File]::WriteAllLines($listFile, $BlobNames)
 
-        # No --recursive flag: --list-of-files specifies exact blob paths, so
-        # recursion is meaningless. azcopy treats each line as a single blob
-        # relative to the source URL.
         $azArgs = @(
             'copy', $sourceUrl, $destUrl,
             '--list-of-files', $listFile,
             '--put-md5'
         )
 
-        # Capture combined stdout+stderr so we can dump it on failure -- without
-        # this, AzCopy's actual error reason is invisible in the pipeline log and
-        # we only see our own generic "exit code N" message. Full raw output is
-        # also preserved in $env:AZCOPY_LOG_LOCATION.
-        $output = & azcopy @azArgs 2>&1
         if ($LASTEXITCODE -ne 0) {
             $output | ForEach-Object { Write-Host $_ }
             throw "AzCopy copy failed with exit code $LASTEXITCODE. See logs in $env:AZCOPY_LOG_LOCATION"
@@ -354,6 +321,7 @@ function Invoke-AzCopyByList {
     }
 }
 
+# Validates destination against source by name, size, and MD5; returns a pass/fail result object.
 function Test-MigrationCompleteness {
     param([System.Collections.IDictionary]$Source, [System.Collections.IDictionary]$Destination)
 
@@ -373,8 +341,7 @@ function Test-MigrationCompleteness {
         $c.Md5MismatchNames | Select-Object -First 10 | ForEach-Object { $issues.Add(" - $_") }
     }
 
-    # Destination-only blobs: present in destination but not in source. Expected
-    # with --delete-destination=false, so informational rather than a failure.
+   
     return [pscustomobject]@{
         Passed            = ($issues.Count -eq 0)
         Issues            = $issues
@@ -391,6 +358,7 @@ function Test-MigrationCompleteness {
     }
 }
 
+# Prints a per-blob comparison table showing size and MD5 match status for every source blob.
 function Show-BlobComparison {
     param(
         [System.Collections.IDictionary]$Source,
@@ -404,9 +372,6 @@ function Show-BlobComparison {
     Write-Host (($base -f 'Blob Name', 'Type', (Format-Cell $SourceContainer 20), (Format-Cell $DestContainer 20)) + ($tail -f 'Size', 'MD5'))
     Write-Host (($base -f ('-' * 50), ('-' * 10), ('-' * 20), ('-' * 20)) + ($tail -f ('-' * 8), ('-' * 8)))
 
-    # Totals are computed across all blobs; only the first $limit rows are
-    # printed to keep the pipeline log readable on large migrations. Full per-
-    # blob detail is in the AzCopy artifact at $env:AZCOPY_LOG_LOCATION.
     [long]$totalSrc = 0
     [long]$totalDst = 0
     foreach ($name in $Source.Keys) {
@@ -457,7 +422,7 @@ function Show-BlobComparison {
     Write-Host ($base -f 'TOTAL', '', (Format-FileSize $totalSrc), (Format-FileSize $totalDst))
 }
 
-# Script
+# ── SCRIPT ────────────────────────────────────────────────────────────────────
 $migrationStart = [datetime]::UtcNow
 $logDir = Initialize-LogDirectory -Log $LogDirectory
 
@@ -466,16 +431,9 @@ $env:AZCOPY_AUTO_LOGIN_TYPE = 'PSCRED'
 $env:AZCOPY_LOG_LOCATION = $logDir
 $env:AZCOPY_JOB_PLAN_LOCATION = $logDir
 
-# Verify the azcopy binary is reachable before doing any work. Without this,
-# a missing executable surfaces deep inside Invoke-AzCopyByList as a generic
-# PowerShell "command not found" with no clear remediation.
 if (-not (Get-Command azcopy -ErrorAction SilentlyContinue)) {
     throw "azcopy executable not found in PATH. Install it on the agent (e.g. via the AzureCLI@2 task or a dedicated AzCopy install step) before running this script."
 }
-
-# All work is wrapped so the MIGRATION TIME block always fires, including on
-# early returns ("nothing to migrate", -WhatIf) and on uncaught exceptions.
-try {
 
 Write-Log 'MIGRATION CONFIGURATION -- source and destination details for this run'
 Write-Host ('Start time:        {0:yyyy-MM-dd HH:mm:ss} UTC' -f $migrationStart)
@@ -493,6 +451,8 @@ Write-Host ('  Storage account: {0}' -f $DestStorageAccount)
 Write-Host ('  Container:       {0}' -f $DestContainer)
 Write-Host ('  URL:             https://{0}.blob.core.windows.net/{1}' -f $DestStorageAccount, $DestContainer)
 
+
+# ── PRE-CHECKS ── verify accounts/containers exist and snapshot blob inventories ─
 Write-Log 'PREPARATION CHECKS -- verifying storage accounts, containers, and inventorying blobs before migration'
 
 Write-Host '[1/3] Verifying source storage account and container exist...'
@@ -515,13 +475,6 @@ $destInventoryBefore = Get-BlobInventory -Context $destCtx -Container $DestConta
 Write-Host ('       Source inventoried:      {0} blob(s)' -f $sourceInventory.Count)
 Write-Host ('       Destination inventoried: {0} blob(s)' -f $destInventoryBefore.Count)
 
-# Backfill MD5 by hashing content for blobs where size matches on both sides
-# but at least one side lacks Content-MD5 metadata. Without this, those blobs
-# fall into the "noMd5" classification and are silently treated as in-sync --
-# meaning a destination modification that happens to land at the same byte
-# count as source would go undetected. Only same-size candidates get hashed:
-# size differences are already conclusive evidence of divergence, no need to
-# pay the download cost to confirm.
 $md5Candidates = New-Object System.Collections.Generic.List[string]
 foreach ($name in $sourceInventory.Keys) {
     if (-not $destInventoryBefore.ContainsKey($name)) { continue }
@@ -539,6 +492,8 @@ if ($md5Candidates.Count -gt 0) {
     Write-Host ('       MD5 backfilled: {0} source blob(s), {1} destination blob(s).' -f $srcResolved, $dstResolved)
 }
 
+
+# ── MIGRATION ── compare source vs destination; identify pending and diverged blobs ─
 $preStatus = Compare-Migration -Source $sourceInventory `
                                   -Destination $destInventoryBefore `
                                   -SourceContainer $SourceContainer `
@@ -550,13 +505,6 @@ if ($preStatus.PendingCount -eq 0) {
     return
 }
 
-# Diverged blobs (size or MD5 mismatch) are NOT copied -- the destination's
-# version stays untouched. They mean something modified the destination outside
-# this migration (manual edit, interrupted prior run, a different process
-# writing to the same container). Report them up front so the operator knows
-# what's being preserved; the script will still fail at the end with these
-# listed as skipped, but only after copying the safe (missing-in-destination)
-# blobs.
 $divergedNames = @($preStatus.SizeMismatchNames) + @($preStatus.Md5MismatchNames)
 if ($divergedNames.Count -gt 0) {
     Write-Log ('DESTINATION DIVERGENCE DETECTED -- these blobs will NOT be copied, pipeline WILL fail')
@@ -581,16 +529,11 @@ if ($divergedNames.Count -gt 0) {
     }
 }
 
-# Safe-to-copy set: pending blobs that aren't diverged. These are the ones
-# missing from destination -- copying them is purely additive and can't destroy
-# any existing destination state.
 $divergedSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
 foreach ($n in $divergedNames) { [void]$divergedSet.Add($n) }
 $toCopy = @($preStatus.PendingNames | Where-Object { -not $divergedSet.Contains($_) })
 
-# Migration
-# Declared outside ShouldProcess so the later `if ($azCopyError)` check is safe
-# under Set-StrictMode even if the early-return paths are ever refactored.
+# ── MIGRATING ── copy missing blobs via azcopy; diverged blobs are skipped ────
 $azCopyError = $null
 if ($toCopy.Count -eq 0) {
     Write-Log ('NOTHING TO COPY -- all {0} pending blob(s) are diverged in destination and will be preserved' -f $divergedNames.Count)
@@ -631,19 +574,11 @@ else {
     return
 }
 
-# Re-inventory destination and validate up front so $failed (used by the
-# SUCCESSFULLY TRANSFERRED / FAILED FILES sections) shares the same rules as
-# the VALIDATION block below. Previously they diverged: $failed only checked
-# size, validation also checked MD5, so an MD5-mismatch blob would appear as
-# "Migrated" in the summary but cause validation to FAIL -- contradictory.
+
+# ── POST-MIGRATION ── re-inventory destination; derive succeeded/failed/skipped ─
 $destInventoryAfter = Get-BlobInventory -Context $destCtx -Container $DestContainer
 $validation = Test-MigrationCompleteness -Source $sourceInventory -Destination $destInventoryAfter
 
-# Scope $failed to blobs we actually tried to copy ($toCopy). Diverged blobs
-# weren't part of the copy operation -- they're tracked separately as $skipped.
-# A blob that was matched at pre-time but mismatched at post-time means source
-# mutated during the run -- reported by validation but not counted as a
-# transfer failure.
 $toCopySet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
 foreach ($n in $toCopy) { [void]$toCopySet.Add($n) }
 
@@ -697,10 +632,7 @@ $null = Compare-Migration -Source $sourceInventory `
                              -DestContainer $DestContainer `
                              -Label 'POST-MIGRATION STATUS -- destination state after copy operations complete'
 
-# Final validation -- always runs so the full comparison table (size + MD5)
-# is logged, even when there are issues. Test-MigrationCompleteness already
-# ran above; we just render its result here. The script throws only after the
-# table has rendered so failures are visible before the pipeline step exits.
+# ── VALIDATION ── compare source vs destination by name, size, and MD5; fail on any mismatch ─
 Write-Log ("VALIDATION -- comparing '{0}' to '{1}' by name, size, and MD5 checksum" -f $SourceContainer, $DestContainer)
 Write-Host ("Comparing {0} blob(s) in '{1}' against {2} blob(s) in '{3}'..." -f $validation.SourceCount, $SourceContainer, $validation.DestCount, $DestContainer)
 if ($validation.DestOnlyCount -gt 0) {
@@ -749,10 +681,6 @@ $validationStatus = if ($overallPass) {
 }
 Write-Host ("Validation:          {0}" -f $validationStatus)
 
-# Failure throws happen here, after all the data sections have been logged, so
-# the user can see exactly which blob failed before the pipeline step exits.
-# The MIGRATION TIME block is emitted from the finally below regardless of
-# whether these throws fire or an earlier error/early-return ended the run.
 if ($azCopyError) {
     throw $azCopyError.Exception
 }
@@ -763,7 +691,6 @@ if (-not $validation.Passed) {
     throw "Validation failed:`n$($validation.Issues -join "`n")"
 }
 
-}
 finally {
     $migrationEnd = [datetime]::UtcNow
     $elapsed = $migrationEnd - $migrationStart
