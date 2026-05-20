@@ -579,6 +579,7 @@ else {
 
 
 # ── POST-MIGRATION ── re-inventory destination; derive succeeded/failed/skipped ─
+<<<<<<< HEAD
 # Skip the re-inventory when no copy operation ran -- destination state is
 # unchanged from $destInventoryBefore, so the round-trip would just be a
 # redundant API call.
@@ -587,6 +588,9 @@ if ($toCopy.Count -gt 0) {
 } else {
     $destInventoryAfter = $destInventoryBefore
 }
+=======
+$destInventoryAfter = Get-BlobInventory -Context $destCtx -Container $DestContainer
+>>>>>>> e299fb68ec7049c78f5ee16713c5369a0bbd1388
 $validation = Test-MigrationCompleteness -Source $sourceInventory -Destination $destInventoryAfter
 
 $toCopySet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
