@@ -223,11 +223,12 @@ function Get-BlobClassification {
         [Parameter(Mandatory)][System.Collections.IDictionary]$Source,
         [Parameter(Mandatory)][System.Collections.IDictionary]$Destination
     )
-    $missing      = [System.Collections.Generic.List[string]]::new()
-    $sizeMismatch = [System.Collections.Generic.List[string]]::new()
-    $md5Mismatch  = [System.Collections.Generic.List[string]]::new()
-    $noMd5        = [System.Collections.Generic.List[string]]::new()
-    $matched      = [System.Collections.Generic.List[string]]::new()
+    $missing       = [System.Collections.Generic.List[string]]::new()
+    $sizeMismatch  = [System.Collections.Generic.List[string]]::new()
+    $md5Mismatch   = [System.Collections.Generic.List[string]]::new()
+    $md5Differing  = [System.Collections.Generic.List[string]]::new()
+    $noMd5         = [System.Collections.Generic.List[string]]::new()
+    $matched       = [System.Collections.Generic.List[string]]::new()
 
     foreach ($name in $Source.Keys) {
         if (-not $Destination.ContainsKey($name)) {
@@ -236,6 +237,14 @@ function Get-BlobClassification {
         }
         $srcBlob = $Source[$name]
         $dstBlob = $Destination[$name]
+
+        # Independent of the bucketing below: counts blobs whose MD5 differs even
+        # if size also differs (which would otherwise short-circuit into sizeMismatch
+        # only). Used for the breakdown count so a both-differ blob shows in both.
+        if ($srcBlob.MD5 -and $dstBlob.MD5 -and $srcBlob.MD5 -ne $dstBlob.MD5) {
+            $md5Differing.Add($name)
+        }
+
         if ($srcBlob.Length -ne $dstBlob.Length) {
             $sizeMismatch.Add($name)
             continue
@@ -254,14 +263,15 @@ function Get-BlobClassification {
     $destOnly = @($Destination.Keys | Where-Object { -not $Source.ContainsKey($_) })
 
     return [pscustomobject]@{
-        SourceCount       = $Source.Count
-        DestCount         = $Destination.Count
-        MissingNames      = @($missing)
-        SizeMismatchNames = @($sizeMismatch)
-        Md5MismatchNames  = @($md5Mismatch)
-        NoMd5Names        = @($noMd5)
-        MatchedNames      = @($matched)
-        DestOnlyNames     = $destOnly
+        SourceCount        = $Source.Count
+        DestCount          = $Destination.Count
+        MissingNames       = @($missing)
+        SizeMismatchNames  = @($sizeMismatch)
+        Md5MismatchNames   = @($md5Mismatch)
+        Md5DifferingNames  = @($md5Differing)
+        NoMd5Names         = @($noMd5)
+        MatchedNames       = @($matched)
+        DestOnlyNames      = $destOnly
     }
 }
 
@@ -290,7 +300,7 @@ function Compare-Migration {
     Write-Host ("Blobs in '{0}': {1}" -f $DestContainer, $c.DestCount)
     Write-Host ('Already migrated:  {0} ({1}%)' -f $alreadyInSync.Count, $migratedPct)
     Write-Host ('Pending:           {0} ({1}%)  [missing: {2}, size-mismatch: {3}, md5-mismatch: {4}]' -f `
-        $pending.Count, $pendingPct, $c.MissingNames.Count, $c.SizeMismatchNames.Count, $c.Md5MismatchNames.Count)
+        $pending.Count, $pendingPct, $c.MissingNames.Count, $c.SizeMismatchNames.Count, $c.Md5DifferingNames.Count)
 
     Show-BlobList -Heading ("Not in $DestContainer")     -Names $c.MissingNames      -SizeSource $Source -Color $script:Ansi.Red
     Show-BlobList -Heading 'Out of sync (size differs)'  -Names $c.SizeMismatchNames -SizeSource $Source -Color $script:Ansi.Yellow
