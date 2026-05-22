@@ -86,9 +86,7 @@ function Assert-StorageAccountExists {
     Write-Host ("Storage account '{0}' found in subscription '{1}'." -f $AccountName, $SubscriptionId)
 }
 
-# Throws if the named container can't be read in the given storage context. Surfaces the
-# underlying error message so the operator can tell account-missing vs container-missing
-# vs permission-denied apart instead of getting a single misleading "doesn't exist."
+# Throws if the named container can't be read in the given storage context. 
 function Assert-ContainerExists {
     param(
         [Parameter(Mandatory)]$Context,
@@ -111,10 +109,6 @@ function Assert-ContainerExists {
 }
 
 # Builds an ordinal (case-sensitive) name → blob metadata dictionary for a container.
-# NOTE: the source side of this inventory is treated as the source-of-truth snapshot
-# for the rest of the run. If source blobs are modified or deleted between this call
-# and the AzCopy copy step, validation will surface the divergence as an MD5/size
-# mismatch -- migration is expected to run against a quiescent source.
 function Get-BlobInventory {
     [OutputType([System.Collections.Generic.Dictionary[string,object]])]
     param(
@@ -204,16 +198,28 @@ function Show-BlobList {
         [string[]]$Names,
         [System.Collections.IDictionary]$SizeSource,
         [int]$Limit = 50,
-        [string]$Color = ''
+        [string]$Color = '',
+        [string]$filePath = ''
     )
     if ($Names.Count -eq 0) { return }
+    $sorted = @($Names | Sort-Object)
     $shown = [Math]::Min($Names.Count, $Limit)
     Write-Host ''
     Write-Host "  $(Colorize "$Heading`:" $Color)"
-    $Names | Sort-Object | Select-Object -First $shown | ForEach-Object {
+    $sorted | Select-Object -First $shown | ForEach-Object {
         Write-Host ('    {0,-50} {1,-10} {2,10}' -f (Format-Cell $_ 50), $SizeSource[$_].BlobType, (Format-FileSize $SizeSource[$_].Length))
     }
-    if ($Names.Count -gt $shown) { Write-Host "    ... and $($Names.Count - $shown) more" }
+    if ($Names.Count -gt $shown) {
+        $more = " ..... and $($Names.Count - $shown) more"
+        if ($filePath) { $more += "(full list: $(Split-Path $filePath -Leaf))" }
+        Write-Host "    $more"
+    }
+    if ($filePath) {
+        $lines = $sorted | ForEach-Object { 
+            ('{0,-80} {1,-12} {2,15}' -f $_, $SizeSource[$_].BlobType, (Format-FileSize $SizeSource[$_].Length))
+        }
+        Set-Content -Path $filePath -Value $lines
+    }
 }
 
 # Single pass: buckets every source blob as missing, size-mismatched, MD5-mismatched, noMd5, or matched.
@@ -238,9 +244,6 @@ function Get-BlobClassification {
         $srcBlob = $Source[$name]
         $dstBlob = $Destination[$name]
 
-        # Independent of the bucketing below: counts blobs whose MD5 differs even
-        # if size also differs (which would otherwise short-circuit into sizeMismatch
-        # only). Used for the breakdown count so a both-differ blob shows in both.
         if ($srcBlob.MD5 -and $dstBlob.MD5 -and $srcBlob.MD5 -ne $dstBlob.MD5) {
             $md5Differing.Add($name)
         }
@@ -283,7 +286,10 @@ function Compare-Migration {
         [System.Collections.IDictionary]$Destination,
         [string]$Label = 'Status',
         [string]$SourceContainer = 'source',
-        [string]$DestContainer = 'destination'
+        [string]$DestContainer = 'destination',
+        [string]$LogDirectory = '',
+        [string]$filePrefix = ''
+
     )
     $c = Get-BlobClassification -Source $Source -Destination $Destination
 
@@ -302,10 +308,15 @@ function Compare-Migration {
     Write-Host ('Pending:           {0} ({1}%)  [missing: {2}, size-mismatch: {3}, md5-mismatch: {4}]' -f `
         $pending.Count, $pendingPct, $c.MissingNames.Count, $c.SizeMismatchNames.Count, $c.Md5DifferingNames.Count)
 
-    Show-BlobList -Heading ("Not in $DestContainer")     -Names $c.MissingNames      -SizeSource $Source -Color $script:Ansi.Red
-    Show-BlobList -Heading 'Out of sync (size differs)'  -Names $c.SizeMismatchNames -SizeSource $Source -Color $script:Ansi.Yellow
-    Show-BlobList -Heading 'Out of sync (MD5 differs)'   -Names $c.Md5MismatchNames  -SizeSource $Source -Color $script:Ansi.Yellow
-    Show-BlobList -Heading ("Already in $DestContainer") -Names $alreadyInSync       -SizeSource $Source
+    $missingFile       = if ($LogDirectory -and $filePrefix) { Join-Path $LogDirectory "$filePrefix-missing.txt" }         else { '' }
+    $sizeMismatchFile  = if ($LogDirectory -and $filePrefix) { Join-Path $LogDirectory "$filePrefix-size-mismatch.txt" }   else { '' }
+    $md5MismatchFile   = if ($LogDirectory -and $filePrefix) { Join-Path $LogDirectory "$filePrefix-md5-mismatch.txt" }    else { '' }
+    $alreadyInSyncFile = if ($LogDirectory -and $filePrefix) { Join-Path $LogDirectory "$filePrefix-already-in-sync.txt" } else { '' }
+
+    Show-BlobList -Heading ("Not in $DestContainer")     -Names $c.MissingNames      -SizeSource $Source -Color $script:Ansi.Red    -filePath $missingFile
+    Show-BlobList -Heading 'Out of sync (size differs)'  -Names $c.SizeMismatchNames -SizeSource $Source -Color $script:Ansi.Yellow -filePath $sizeMismatchFile
+    Show-BlobList -Heading 'Out of sync (MD5 differs)'   -Names $c.Md5MismatchNames  -SizeSource $Source -Color $script:Ansi.Yellow -filePath $md5MismatchFile
+    Show-BlobList -Heading ("Already in $DestContainer") -Names $alreadyInSync       -SizeSource $Source                            -filePath $alreadyInSyncFile
 
     return [pscustomobject]@{
         PendingCount       = $pending.Count
@@ -316,7 +327,7 @@ function Compare-Migration {
     }
 }
 
-# Runs azcopy copy for an explicit blob list; --put-md5 stamps checksums for post-migration validation.
+# Runs azcopy copy for an explicit blob list.
 function Invoke-AzCopyByList {
     param(
         [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$SourceAccount,
@@ -335,8 +346,7 @@ function Invoke-AzCopyByList {
         [System.IO.File]::WriteAllLines($listFile, $BlobNames)
 
         & azcopy copy $sourceUrl $destUrl `
-             --list-of-files $listFile `
-             --put-md5 2>&1 | ForEach-Object { Write-Host $_ }
+             --list-of-files $listFile 2>&1 | ForEach-Object { Write-Host $_ }
 
         $exit = $LASTEXITCODE
         if ($exit -ne 0) {
@@ -388,13 +398,16 @@ function Test-MigrationCompleteness {
 }
 
 # Prints a per-blob comparison table showing size and MD5 match status for every source blob.
+# When -filePath is set, also writes a full CSV of every source blob (no row cap) so the
+# artifact carries the complete comparison even when the console output is truncated.
 function Show-BlobComparison {
     param(
         [System.Collections.IDictionary]$Source,
         [System.Collections.IDictionary]$Destination,
         [string]$SourceContainer = 'source',
         [string]$DestContainer = 'destination',
-        [string]$LogDirectory = ''
+        [string]$LogDirectory = '',
+        [string]$filePath = ''
     )
     $base = '  {0,-50} {1,-10} {2,20} {3,20}'
     $tail = '  {0,-8}  {1,-8}'
@@ -410,7 +423,7 @@ function Show-BlobComparison {
         }
     }
 
-    $limit = 100
+    $limit = 500
     $names = @($Source.Keys | Sort-Object)
     $shown = [Math]::Min($names.Count, $limit)
     for ($i = 0; $i -lt $shown; $i++) {
@@ -445,10 +458,41 @@ function Show-BlobComparison {
         }
     }
     if ($names.Count -gt $shown) {
-        Write-Host ('    ... and {0} more (see AzCopy logs in {1})' -f ($names.Count - $shown), $LogDirectory)
+        $more = '    ... and {0} more' -f ($names.Count - $shown)
+        if ($filePath) { $more += " (full comparison: $(Split-Path $filePath -Leaf))" }
+        else           { $more += " (see AzCopy logs in $LogDirectory)" }
+        Write-Host $more
     }
     Write-Host (($base -f ('-' * 50), ('-' * 10), ('-' * 20), ('-' * 20)) + ($tail -f ('-' * 8), ('-' * 8)))
     Write-Host ($base -f 'TOTAL', '', (Format-FileSize $totalSrc), (Format-FileSize $totalDst))
+
+    if ($filePath) {
+        $rows = foreach ($name in $names) {
+            $src = $Source[$name]
+            $hasDst = $Destination.ContainsKey($name)
+            $dst = if ($hasDst) { $Destination[$name] } else { $null }
+
+            $sizeStatus = if (-not $hasDst)                    { 'MISSING' }
+                          elseif ($src.Length -ne $dst.Length) { 'MISMATCH' }
+                          else                                 { 'OK' }
+            $md5Status  = if (-not $hasDst)                          { 'MISSING' }
+                          elseif (-not $src.MD5 -or -not $dst.MD5)   { 'N/A' }
+                          elseif ($src.MD5 -ne $dst.MD5)             { 'MISMATCH' }
+                          else                                       { 'OK' }
+
+            [pscustomobject]@{
+                Name       = $name
+                BlobType   = $src.BlobType
+                SourceSize = $src.Length
+                DestSize   = if ($hasDst) { $dst.Length } else { '' }
+                SourceMD5  = $src.MD5
+                DestMD5    = if ($hasDst) { $dst.MD5 } else { '' }
+                SizeStatus = $sizeStatus
+                Md5Status  = $md5Status
+            }
+        }
+        $rows | Export-Csv -NoTypeInformation -Path $filePath
+    }
 }
 
 # ── SCRIPT ────────────────────────────────────────────────────────────────────
@@ -502,7 +546,6 @@ Assert-ContainerExists -Context $destCtx -Container $DestContainer -AccountName 
 
 $step++; Write-Host "[$step/$totalSteps] Inventorying source and destination containers..."
 # Data-plane calls use the storage context's own AAD token, so the active
-# Az subscription doesn't matter here.
 $sourceInventory = Get-BlobInventory -Context $sourceCtx -Container $SourceContainer
 $destInventoryBefore = Get-BlobInventory -Context $destCtx -Container $DestContainer
 Write-Host ('       Source inventoried:      {0} blob(s)' -f $sourceInventory.Count)
@@ -529,12 +572,9 @@ $preStatus = Compare-Migration -Source $sourceInventory `
                                   -Destination $destInventoryBefore `
                                   -SourceContainer $SourceContainer `
                                   -DestContainer $DestContainer `
-                                  -Label 'PRE-MIGRATION STATUS -- snapshot of source vs destination before any copy operations'
-
-# Don't early-return when nothing is pending: still run validation so the
-# operator gets the same comparison table / PASS verdict whether or not any
-# copy work was needed. The migration block below no-ops cleanly when
-# $toCopy is empty.
+                                  -Label 'PRE-MIGRATION STATUS -- snapshot of source vs destination before any copy operations' `
+                                  -LogDirectory $logDir `
+                                  -filePrefix 'pre'
 
 $divergedNames = @($preStatus.SizeMismatchNames) + @($preStatus.Md5MismatchNames)
 if ($divergedNames.Count -gt 0) {
@@ -583,13 +623,8 @@ elseif ($PSCmdlet.ShouldProcess(
     }
     Write-Log $migrateLabel
     [long]$migrationTotalSize = 0
-    $toCopy | Sort-Object | ForEach-Object {
-        $size = $sourceInventory[$_].Length
-        $migrationTotalSize += $size
-        Write-Host ('  {0,-50} {1,-10} {2,10}' -f (Format-Cell $_ 50), $sourceInventory[$_].BlobType, (Format-FileSize $size))
-    }
-    Write-Host ''
-    Write-Host ('  Total: {0} file(s), {1}' -f $toCopy.Count, (Format-FileSize $migrationTotalSize))
+    foreach ($name in $toCopy) { $migrationTotalSize += $sourceInventory[$name].Length }
+    Write-Host ('  Migrating: {0} blobs(s), total size: {1}' -f $toCopy.Count, (Format-FileSize $migrationTotalSize))
 
     try {
         Invoke-AzCopyByList -SourceAccount $SourceStorageAccount `
@@ -608,11 +643,7 @@ else {
     return
 }
 
-
 # ── POST-MIGRATION ── re-inventory destination; derive succeeded/failed/skipped ─
-# Skip the re-inventory when no copy operation ran -- destination state is
-# unchanged from $destInventoryBefore, so the round-trip would just be a
-# redundant API call.
 if ($toCopy.Count -gt 0) {
     $destInventoryAfter = Get-BlobInventory -Context $destCtx -Container $DestContainer
 } else {
@@ -639,7 +670,7 @@ if ($succeeded.Count -gt 0) {
         Write-Host ('  All {0} copied blob(s) transferred successfully.' -f $succeeded.Count)
     } else {
         Write-Host ('  {0} of {1} blob(s) transferred successfully.' -f $succeeded.Count, $toCopy.Count)
-        Show-BlobList -Heading ("Transferred to $DestContainer") -Names $succeeded -SizeSource $sourceInventory
+        Show-BlobList -Heading ("Transferred to $DestContainer") -Names $succeeded -SizeSource $sourceInventory -filePath (Join-Path $logDir 'transferred.txt')
     }
 }
 
@@ -670,14 +701,16 @@ $null = Compare-Migration -Source $sourceInventory `
                              -Destination $destInventoryAfter `
                              -SourceContainer $SourceContainer `
                              -DestContainer $DestContainer `
-                             -Label 'POST-MIGRATION STATUS -- destination state after copy operations complete'
+                             -Label 'POST-MIGRATION STATUS -- destination state after copy operations complete' `
+                             -LogDirectory $logDir `
+                             -filePrefix 'post'
 
 # ── VALIDATION ── compare source vs destination by name, size, and MD5; fail on any mismatch ─
 Write-Log ("VALIDATION -- comparing '{0}' to '{1}' by name, size, and MD5 checksum" -f $SourceContainer, $DestContainer)
 Write-Host ("Comparing {0} blob(s) in '{1}' against {2} blob(s) in '{3}'..." -f $validation.SourceCount, $SourceContainer, $validation.DestCount, $DestContainer)
 if ($validation.DestOnlyCount -gt 0) {
     Write-Host ('Note: destination contains {0} blob(s) not present in source (preserved -- only blobs listed in $toCopy are copied).' -f $validation.DestOnlyCount)
-    Show-BlobList -Heading ("Only in $DestContainer") -Names $validation.DestOnlyNames -SizeSource $destInventoryAfter
+    Show-BlobList -Heading ("Only in $DestContainer") -Names $validation.DestOnlyNames -SizeSource $destInventoryAfter -filePath (Join-Path $logDir 'dest-only.txt')
 }
 Write-Host ''
 if ($validation.Passed) {
@@ -691,11 +724,11 @@ if ($validation.Passed) {
     }
     Write-Host ("'{0}' data left untouched." -f $SourceContainer)
     Write-Host ''
-    Show-BlobComparison -Source $sourceInventory -Destination $destInventoryAfter -SourceContainer $SourceContainer -DestContainer $DestContainer -LogDirectory $logDir
+    Show-BlobComparison -Source $sourceInventory -Destination $destInventoryAfter -SourceContainer $SourceContainer -DestContainer $DestContainer -LogDirectory $logDir -filePath (Join-Path $logDir 'blob-comparison.csv')
 }
 else {
     Write-Host ''
-    Show-BlobComparison -Source $sourceInventory -Destination $destInventoryAfter -SourceContainer $SourceContainer -DestContainer $DestContainer -LogDirectory $logDir
+    Show-BlobComparison -Source $sourceInventory -Destination $destInventoryAfter -SourceContainer $SourceContainer -DestContainer $DestContainer -LogDirectory $logDir -filePath (Join-Path $logDir 'blob-comparison.csv')
     Write-Host ''
     Write-Host "$(Colorize 'FAIL' $script:Ansi.Red) -- validation issues found:"
     foreach ($issue in $validation.Issues) {
