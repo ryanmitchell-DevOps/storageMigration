@@ -346,7 +346,8 @@ function Invoke-AzCopyByList {
         [System.IO.File]::WriteAllLines($listFile, $BlobNames)
 
         & azcopy copy $sourceUrl $destUrl `
-             --list-of-files $listFile 2>&1 | ForEach-Object { Write-Host $_ }
+             --list-of-files $listFile `
+             --list-of-files $listFile  2>&1 | ForEach-Object { Write-Host $_ }
 
         $exit = $LASTEXITCODE
         if ($exit -ne 0) {
@@ -572,9 +573,7 @@ $preStatus = Compare-Migration -Source $sourceInventory `
                                   -Destination $destInventoryBefore `
                                   -SourceContainer $SourceContainer `
                                   -DestContainer $DestContainer `
-                                  -Label 'PRE-MIGRATION STATUS -- snapshot of source vs destination before any copy operations' `
-                                  -LogDirectory $logDir `
-                                  -filePrefix 'pre'
+                                  -Label 'PRE-MIGRATION STATUS -- snapshot of source vs destination before any copy operations'
 
 $divergedNames = @($preStatus.SizeMismatchNames) + @($preStatus.Md5MismatchNames)
 if ($divergedNames.Count -gt 0) {
