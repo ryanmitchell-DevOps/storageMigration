@@ -399,8 +399,6 @@ function Test-MigrationCompleteness {
 }
 
 # Prints a per-blob comparison table showing size and MD5 match status for every source blob.
-# When -filePath is set, also writes a full CSV of every source blob (no row cap) so the
-# artifact carries the complete comparison even when the console output is truncated.
 function Show-BlobComparison {
     param(
         [System.Collections.IDictionary]$Source,
