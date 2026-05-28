@@ -412,7 +412,8 @@ function Invoke-AzCopyByList {
 
         $state = @{ LastProgress = [datetime]::UtcNow }
         & azcopy copy $sourceUrl $destUrl `
-             --list-of-files $listFile 2>&1 | ForEach-Object {
+             --list-of-files $listFile `
+             --s2s-preserve-blob-tags 2>&1 | ForEach-Object {
             if ("$_".Trim() -match '^\d+(\.\d+)?\s*%') {
                 $now = [datetime]::UtcNow
                 if (($now - $state.LastProgress).TotalSeconds -lt 60) { return }
