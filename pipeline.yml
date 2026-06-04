@@ -1,57 +1,113 @@
 trigger: none
 
-parameters:
-  - name: serviceConnection
-    displayName: 'Azure Service Connection'
-    type: string
-  - name: sourceSubscriptionId
-    displayName: 'Source Subscription ID'
-    type: string
-  - name: sourceStorageAccount
-    displayName: 'Source Storage Account Name'
-    type: string
-  - name: sourceContainer
-    displayName: 'Source Container Name'
-    type: string
-  - name: destSubscriptionId
-    displayName: 'Destination Subscription ID'
-    type: string
-  - name: destStorageAccount
-    displayName: 'Destination Storage Account Name'
-    type: string
-  - name: destContainer
-    displayName: 'Destination Container Name'
-    type: string
-
 name: storage-migration_$(Date:yyyyMMdd)$(Rev:.r)
 
+variables:
+  # Dev env variables - update as needed per stage and container changes
+  # TODO: Consider parameterizing in future 
+  serviceConnection: 'FT-DairyNet-Cloud-DEV-001-CICD'
+  sourceSubscriptionId: '5da85cc1-3781-4b0a-91ed-88eada0a607e'
+  sourceStorageAccount: 'dnclogbooka774dev'
+  sourceContainer: 'attachments'
+  destSubscriptionId: 'f126b605-e800-4bf0-b24c-84f03684f2c5'
+  destStorageAccount: 'stdncstoragecvfmy'
+  destContainer: 'data-migration-trial-dev'
+
 pool:
-  vmImage: ubuntu-latest
+  name: caf-pool-ftdairynetclouddevf126
 
 stages:
   - stage: StorageMigration
-    displayName: 'Storage Migration'
+    displayName: 'Container Storage Migration'
     jobs:
-      - job: Migrate
-        displayName: 'Migrate Container'
+      - job: MigrationPlan
+        displayName: 'Inventory & Preview'
         workspace:
           clean: all
         steps:
           - checkout: self
 
+          # Install & Set Up
+          - bash: |
+              curl -sSL https://github.com/PowerShell/PowerShell/releases/download/v7.4.2/powershell-7.4.2-linux-x64.tar.gz -o /tmp/powershell.tar.gz
+              mkdir -p ~/.local/powershell
+              tar zxf /tmp/powershell.tar.gz -C ~/.local/powershell
+              echo "##vso[task.prependpath]$HOME/.local/powershell"
+              ~/.local/powershell/pwsh --version
+            displayName: 'Install PowerShell'
+
+          - bash: |
+              export PATH="$HOME/.local/powershell:$PATH"
+              pwsh -Command "Install-Module Az.Accounts -Force -Scope CurrentUser; Install-Module Az.Storage -Force -Scope CurrentUser -MinimumVersion 6.0.0; Install-Module Az.Resources -Force -Scope CurrentUser"
+            displayName: 'Install Az PowerShell modules'
+
+          - bash: |
+              curl -sSL https://aka.ms/downloadazcopy-v10-linux -o /tmp/azcopy.tar.gz
+              mkdir -p ~/.local/azcopy
+              tar zxf /tmp/azcopy.tar.gz -C ~/.local/azcopy --strip-components=1
+              echo "##vso[task.prependpath]$HOME/.local/azcopy"
+              ~/.local/azcopy/azcopy --version
+            displayName: 'Install AzCopy'
+
+          # Preview migration with -WhatIf
           - task: AzurePowerShell@5
-            displayName: 'Run storage migration'
+            displayName: 'Preview Storage Migration (-WhatIf)'
             inputs:
-              azureSubscription: ${{ parameters.serviceConnection }}
+              azureSubscription: $(serviceConnection)
               ScriptType: FilePath
-              ScriptPath: scripts/storage-migration.ps1
+              ScriptPath: migrations/storage/storage-migration.ps1
               ScriptArguments: >-
-                -SourceSubscriptionId '${{ parameters.sourceSubscriptionId }}'
-                -SourceStorageAccount '${{ parameters.sourceStorageAccount }}'
-                -SourceContainer '${{ parameters.sourceContainer }}'
-                -DestSubscriptionId '${{ parameters.destSubscriptionId }}'
-                -DestStorageAccount '${{ parameters.destStorageAccount }}'
-                -DestContainer '${{ parameters.destContainer }}'
+                -SourceSubscriptionId '$(sourceSubscriptionId)'
+                -SourceStorageAccount '$(sourceStorageAccount)'
+                -SourceContainer '$(sourceContainer)'
+                -DestSubscriptionId '$(destSubscriptionId)'
+                -DestStorageAccount '$(destStorageAccount)'
+                -DestContainer '$(destContainer)'
+                -WhatIf
+              azurePowerShellVersion: LatestVersion
+              pwsh: true
+
+          - task: PublishPipelineArtifact@1
+            displayName: 'Publish migration plan'
+            condition: always()
+            inputs:
+              targetPath: '$(Build.ArtifactStagingDirectory)/migration-plan'
+              artifact: 'migration-plan'
+
+      - job: ManualApproval
+        displayName: 'Approve Plan'
+        dependsOn: MigrationPlan
+        pool: server
+        steps:
+          - task: ManualValidation@1
+            inputs:
+              notifyUsers: ''
+              instructions: 'Review the migration plan and approve to proceed with the migration.'
+              onTimeout: 'reject'
+              timeout: '1440' # 1 day
+
+      - job: MigrateStorageContainer
+        displayName: 'Migrate Storage Container'
+        dependsOn: ManualApproval
+        workspace:
+          clean: all
+        steps:
+          - checkout: self
+
+          # Execute migration
+          - task: AzurePowerShell@5
+            displayName: 'Execute Storage Migration'
+            inputs:
+              azureSubscription: $(serviceConnection)
+              ScriptType: FilePath
+              ScriptPath: migrations/storage/storage-migration.ps1
+              ScriptArguments: >-
+                -SourceSubscriptionId '$(sourceSubscriptionId)'
+                -SourceStorageAccount '$(sourceStorageAccount)'
+                -SourceContainer '$(sourceContainer)'
+                -DestSubscriptionId '$(destSubscriptionId)'
+                -DestStorageAccount '$(destStorageAccount)'
+                -DestContainer '$(destContainer)'
               azurePowerShellVersion: LatestVersion
               pwsh: true
 
