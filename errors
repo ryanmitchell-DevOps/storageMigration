@@ -1,0 +1,10 @@
+~$ grep -rn debian.org /etc/apt
+grep: /etc/apt/trusted.gpg.d/debian-archive-buster-stable.gpg: binary file matches
+grep: /etc/apt/trusted.gpg.d/debian-archive-bookworm-security-automatic.gpg: binary file matches
+grep: /etc/apt/trusted.gpg.d/debian-archive-buster-automatic.gpg: binary file matches
+grep: /etc/apt/trusted.gpg.d/debian-archive-bullseye-stable.gpg: binary file matches
+grep: /etc/apt/trusted.gpg.d/debian-archive-bookworm-automatic.gpg: binary file matches
+grep: /etc/apt/trusted.gpg.d/debian-archive-bullseye-automatic.gpg: binary file matches
+grep: /etc/apt/trusted.gpg.d/debian-archive-bullseye-security-automatic.gpg: binary file matches
+grep: /etc/apt/trusted.gpg.d/debian-archive-bookworm-stable.gpg: binary file matches
+grep: /etc/apt/trusted.gpg.d/debian-archive-buster-security-automatic.gpg: binary file matches
