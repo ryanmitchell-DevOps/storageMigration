@@ -37,7 +37,7 @@ param(
     # Blobs listed/checked per page. Small = lower flat memory, more round-trips (slower
     # planning). Larger = still flat but higher memory, fewer round-trips (faster planning).
     # The copy time is unaffected -- azcopy always gets the full list in one streamed job.
-    [ValidateRange(1, 50000)][int]$BatchSize = 20,
+    [ValidateRange(1, 50000)][int]$BatchSize = 50,
 
     # Write the full per-blob ledgers (pre-blob-status.csv / post-blob-status.csv, including
     # DestOnly rows). On by default. Set to $false to skip the extra streaming passes for speed.
