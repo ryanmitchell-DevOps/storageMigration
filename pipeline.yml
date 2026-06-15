@@ -5,16 +5,16 @@ name: storage-migration_$(Date:yyyyMMdd)$(Rev:.r)
 variables:
   # Dev env variables - update as needed per stage and container changes
   # TODO: Consider parameterizing in future 
-  serviceConnection: 'FT-DairyNet-Cloud-DEV-001-CICD'
-  sourceSubscriptionId: '5da85cc1-3781-4b0a-91ed-88eada0a607e'
-  sourceStorageAccount: 'dnclogbooka774dev'
-  sourceContainer: 'attachments'
-  destSubscriptionId: 'f126b605-e800-4bf0-b24c-84f03684f2c5'
-  destStorageAccount: 'stdncstoragecvfmy'
-  destContainer: 'data-migration-trial-dev'
+  serviceConnection: 'FT-DairyNet-Cloud-PROD-001-CICD'
+  sourceSubscriptionId: '3cd7b099-993c-4d72-bc13-1408376a88a6'
+  sourceStorageAccount: 'dncstorage33cdprd'
+  sourceContainer: 'dnc-dataexplorer-prd'
+  destSubscriptionId: '1dc32f4d-fc9d-4077-a568-777d2ccfcdb2'
+  destStorageAccount: 'stdncstorage3ok0r'
+  destContainer: 'data-migration-trial-prd'
 
 pool:
-  name: caf-pool-ftdairynetclouddevf126
+  name: caf-pool-ftdairynetcloudpro1dc3
 
 stages:
   - stage: StorageMigration
@@ -27,27 +27,7 @@ stages:
         steps:
           - checkout: self
 
-          # Install & Set Up
-          - bash: |
-              curl -sSL https://github.com/PowerShell/PowerShell/releases/download/v7.4.2/powershell-7.4.2-linux-x64.tar.gz -o /tmp/powershell.tar.gz
-              mkdir -p ~/.local/powershell
-              tar zxf /tmp/powershell.tar.gz -C ~/.local/powershell
-              echo "##vso[task.prependpath]$HOME/.local/powershell"
-              ~/.local/powershell/pwsh --version
-            displayName: 'Install PowerShell'
-
-          - bash: |
-              export PATH="$HOME/.local/powershell:$PATH"
-              pwsh -Command "Install-Module Az.Accounts -Force -Scope CurrentUser; Install-Module Az.Storage -Force -Scope CurrentUser -MinimumVersion 6.0.0; Install-Module Az.Resources -Force -Scope CurrentUser"
-            displayName: 'Install Az PowerShell modules'
-
-          - bash: |
-              curl -sSL https://aka.ms/downloadazcopy-v10-linux -o /tmp/azcopy.tar.gz
-              mkdir -p ~/.local/azcopy
-              tar zxf /tmp/azcopy.tar.gz -C ~/.local/azcopy --strip-components=1
-              echo "##vso[task.prependpath]$HOME/.local/azcopy"
-              ~/.local/azcopy/azcopy --version
-            displayName: 'Install AzCopy'
+          - template: ../migrations/storage/install-migration-tools.yml
 
           # Preview migration with -WhatIf
           - task: AzurePowerShell@5
@@ -93,6 +73,8 @@ stages:
           clean: all
         steps:
           - checkout: self
+
+          - template: ../migrations/storage/install-migration-tools.yml
 
           # Execute migration
           - task: AzurePowerShell@5
