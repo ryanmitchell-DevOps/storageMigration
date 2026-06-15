@@ -39,6 +39,10 @@ param(
     # The copy time is unaffected -- azcopy always gets the full list in one streamed job.
     [ValidateRange(1, 50000)][int]$BatchSize = 20,
 
+    # Write the full per-blob ledgers (pre-blob-status.csv / post-blob-status.csv, including
+    # DestOnly rows). On by default. Set to $false to skip the extra streaming passes for speed.
+    [bool]$BlobStatusReport = $true,
+
     [string]$LogDirectory
 )
 
@@ -164,8 +168,8 @@ function Assert-ContainerExists {
     Write-Host ("Container '{0}' found in '{1}'." -f $Container, $AccountName)
 }
 
-# Looks up a single destination blob; returns the blob object or $null if it doesn't exist.
-function Get-DestBlob {
+# Looks up a single blob in a container; returns the blob object or $null if it doesn't exist.
+function Get-BlobIfExists {
     param(
         [Parameter(Mandatory)]$Context,
         [Parameter(Mandatory)][string]$Container,
@@ -174,6 +178,106 @@ function Get-DestBlob {
     $blob = Get-AzStorageBlob -Blob $BlobName -Container $Container -Context $Context -ErrorAction SilentlyContinue
     if (-not $blob) { return $null }
     return $blob
+}
+
+# Classifies one source blob against its destination counterpart. Status strings match the
+# old pre/post-blob-status.csv so downstream tooling doesn't change.
+function Resolve-BlobStatus {
+    [OutputType([string])]
+    param(
+        [AllowNull()]$Dst,
+        [long]$SrcLen,
+        [AllowEmptyString()][string]$SrcMd5,
+        [long]$DstLen,
+        [AllowEmptyString()][string]$DstMd5
+    )
+    if ($null -eq $Dst)            { return 'Missing' }
+    if ($SrcLen -ne $DstLen)       { return 'SizeMismatch' }
+    if (-not $SrcMd5 -or -not $DstMd5) { return 'Matched (size only -- no MD5)' }
+    if ($SrcMd5 -ne $DstMd5)       { return 'Md5Mismatch' }
+    return 'Matched'
+}
+
+# Streams the destination container and appends a DestOnly row to the ledger for every blob
+# that has no counterpart in the source. One page in memory at a time. Returns the count.
+function Add-DestOnlyRows {
+    [OutputType([long])]
+    param(
+        [Parameter(Mandatory)]$DestContext,
+        [Parameter(Mandatory)][string]$DestContainer,
+        [Parameter(Mandatory)]$SourceContext,
+        [Parameter(Mandatory)][string]$SourceContainer,
+        [Parameter(Mandatory)][int]$BatchSize,
+        [Parameter(Mandatory)][System.IO.StreamWriter]$LedgerWriter
+    )
+    $destOnly = 0L
+    $token = $null
+    do {
+        $page = @(Get-AzStorageBlob -Container $DestContainer -Context $DestContext `
+                    -MaxCount $BatchSize -ContinuationToken $token -ErrorAction Stop)
+        if ($page.Count -eq 0) { break }
+        $last = $page[$page.Count - 1]
+        $token = if ($last.PSObject.Properties['ContinuationToken']) { $last.ContinuationToken } else { $null }
+
+        foreach ($b in $page) {
+            $src = Get-BlobIfExists -Context $SourceContext -Container $SourceContainer -BlobName $b.Name
+            if ($null -eq $src) {
+                $destOnly++
+                $LedgerWriter.WriteLine('{0},{1},,{2},,{3},DestOnly' -f `
+                    (ConvertTo-CsvField $b.Name), [string]$b.BlobType, [long]$b.Length, (Get-BlobMd5 $b))
+            }
+        }
+    } while ($null -ne $token)
+    return $destOnly
+}
+
+# Writes a full per-blob ledger (every source blob + DestOnly rows) to $StatusCsvPath by
+# streaming both containers. Used for the post-migration ledger. Bounded memory throughout.
+function Write-StatusLedger {
+    [OutputType([long])]
+    param(
+        [Parameter(Mandatory)]$SourceContext,
+        [Parameter(Mandatory)][string]$SourceContainer,
+        [Parameter(Mandatory)]$DestContext,
+        [Parameter(Mandatory)][string]$DestContainer,
+        [Parameter(Mandatory)][int]$BatchSize,
+        [Parameter(Mandatory)][string]$StatusCsvPath
+    )
+    $w = [System.IO.StreamWriter]::new($StatusCsvPath, $false)
+    $destOnly = 0L
+    try {
+        $w.WriteLine('Name,BlobType,SourceSize,DestSize,SourceMD5,DestMD5,Status')
+        $token = $null
+        do {
+            $page = @(Get-AzStorageBlob -Container $SourceContainer -Context $SourceContext `
+                        -MaxCount $BatchSize -ContinuationToken $token -ErrorAction Stop)
+            if ($page.Count -eq 0) { break }
+            $last = $page[$page.Count - 1]
+            $token = if ($last.PSObject.Properties['ContinuationToken']) { $last.ContinuationToken } else { $null }
+
+            foreach ($b in $page) {
+                $srcLen = [long]$b.Length
+                $srcMd5 = Get-BlobMd5 $b
+                $dst    = Get-BlobIfExists -Context $DestContext -Container $DestContainer -BlobName $b.Name
+                $dstLen = if ($dst) { [long]$dst.Length } else { 0 }
+                $dstMd5 = if ($dst) { Get-BlobMd5 $dst } else { $null }
+                $status = Resolve-BlobStatus -Dst $dst -SrcLen $srcLen -SrcMd5 $srcMd5 -DstLen $dstLen -DstMd5 $dstMd5
+                if ($null -eq $dst) {
+                    $w.WriteLine('{0},{1},{2},,{3},,{4}' -f (ConvertTo-CsvField $b.Name), [string]$b.BlobType, $srcLen, $srcMd5, $status)
+                } else {
+                    $w.WriteLine('{0},{1},{2},{3},{4},{5},{6}' -f (ConvertTo-CsvField $b.Name), [string]$b.BlobType, $srcLen, $dstLen, $srcMd5, $dstMd5, $status)
+                }
+            }
+        } while ($null -ne $token)
+
+        $destOnly = Add-DestOnlyRows -DestContext $DestContext -DestContainer $DestContainer `
+                                     -SourceContext $SourceContext -SourceContainer $SourceContainer `
+                                     -BatchSize $BatchSize -LedgerWriter $w
+    }
+    finally {
+        $w.Dispose()
+    }
+    return $destOnly
 }
 
 # Streams the source container in pages, classifies each blob against the destination, and
@@ -187,7 +291,9 @@ function Build-MigrationPlan {
         [Parameter(Mandatory)]$DestContext,
         [Parameter(Mandatory)][string]$DestContainer,
         [Parameter(Mandatory)][int]$BatchSize,
-        [Parameter(Mandatory)][string]$PlanDirectory
+        [Parameter(Mandatory)][string]$PlanDirectory,
+        # When set, also write a full per-blob ledger (every source blob + DestOnly rows) here.
+        [string]$StatusCsvPath
     )
     $planCsvPath  = Join-Path $PlanDirectory 'migration-plan.csv'
     $copyListPath = Join-Path $PlanDirectory 'copy-list.txt'        # names only, for azcopy --list-of-files
@@ -198,14 +304,16 @@ function Build-MigrationPlan {
     $copyList = [System.IO.StreamWriter]::new($copyListPath, $false)
     $manifest = [System.IO.StreamWriter]::new($manifestPath, $false)
     $diverged = [System.IO.StreamWriter]::new($divergedPath, $false)
+    $ledger   = if ($StatusCsvPath) { [System.IO.StreamWriter]::new($StatusCsvPath, $false) } else { $null }
 
-    $sourceCount = 0L; $copyCount = 0L; $divergedCount = 0L; $inSyncCount = 0L; [long]$copyBytes = 0
+    $sourceCount = 0L; $copyCount = 0L; $divergedCount = 0L; $inSyncCount = 0L; $destOnlyCount = 0L; [long]$copyBytes = 0
     $batchNumber = 0L
     $divergedSample = [System.Collections.Generic.List[string]]::new()
 
     try {
         $csv.WriteLine('BlobName,Action,BlobType,SizeBytes,Reason')
         $diverged.WriteLine('BlobName,BlobType,SourceSize,DestSize,Reason')
+        if ($ledger) { $ledger.WriteLine('Name,BlobType,SourceSize,DestSize,SourceMD5,DestMD5,Status') }
 
         $token = $null
         do {
@@ -224,35 +332,42 @@ function Build-MigrationPlan {
                 $srcMd5  = Get-BlobMd5 $b
                 $sourceCount++
 
-                $dst = Get-DestBlob -Context $DestContext -Container $DestContainer -BlobName $name
+                $dst    = Get-BlobIfExists -Context $DestContext -Container $DestContainer -BlobName $name
+                $dstLen = if ($dst) { [long]$dst.Length } else { 0 }
+                $dstMd5 = if ($dst) { Get-BlobMd5 $dst } else { $null }
+                $status = Resolve-BlobStatus -Dst $dst -SrcLen $srcLen -SrcMd5 $srcMd5 -DstLen $dstLen -DstMd5 $dstMd5
 
-                if ($null -eq $dst) {
-                    $copyCount++; $copyBytes += $srcLen
-                    $csv.WriteLine('{0},Copy,{1},{2},Missing from destination' -f (ConvertTo-CsvField $name), $srcType, $srcLen)
-                    $copyList.WriteLine($name)
-                    $manifest.WriteLine(("{0}`t{1}`t{2}" -f $name, $srcLen, $srcMd5))
-                    continue
+                if ($ledger) {
+                    if ($null -eq $dst) {
+                        $ledger.WriteLine('{0},{1},{2},,{3},,{4}' -f (ConvertTo-CsvField $name), $srcType, $srcLen, $srcMd5, $status)
+                    } else {
+                        $ledger.WriteLine('{0},{1},{2},{3},{4},{5},{6}' -f (ConvertTo-CsvField $name), $srcType, $srcLen, $dstLen, $srcMd5, $dstMd5, $status)
+                    }
                 }
 
-                $dstLen = [long]$dst.Length
-                $dstMd5 = Get-BlobMd5 $dst
-
-                if ($srcLen -ne $dstLen) {
-                    $divergedCount++
-                    $reason = 'Size mismatch'
-                    $csv.WriteLine('{0},Skip-Diverged,{1},{2},{3}' -f (ConvertTo-CsvField $name), $srcType, $srcLen, $reason)
-                    $diverged.WriteLine('{0},{1},{2},{3},{4}' -f (ConvertTo-CsvField $name), $srcType, $srcLen, $dstLen, $reason)
-                    if ($divergedSample.Count -lt 50) { $divergedSample.Add(("{0}  (source={1}, dest={2})" -f $name, (Format-FileSize $srcLen), (Format-FileSize $dstLen))) }
-                }
-                elseif ($srcMd5 -and $dstMd5 -and $srcMd5 -ne $dstMd5) {
-                    $divergedCount++
-                    $reason = 'MD5 mismatch'
-                    $csv.WriteLine('{0},Skip-Diverged,{1},{2},{3}' -f (ConvertTo-CsvField $name), $srcType, $srcLen, $reason)
-                    $diverged.WriteLine('{0},{1},{2},{3},{4}' -f (ConvertTo-CsvField $name), $srcType, $srcLen, $dstLen, $reason)
-                    if ($divergedSample.Count -lt 50) { $divergedSample.Add(("{0}  (source-md5={1}, dest-md5={2})" -f $name, $srcMd5, $dstMd5)) }
-                }
-                else {
-                    $inSyncCount++
+                switch ($status) {
+                    'Missing' {
+                        $copyCount++; $copyBytes += $srcLen
+                        $csv.WriteLine('{0},Copy,{1},{2},Missing from destination' -f (ConvertTo-CsvField $name), $srcType, $srcLen)
+                        $copyList.WriteLine($name)
+                        $manifest.WriteLine(("{0}`t{1}`t{2}" -f $name, $srcLen, $srcMd5))
+                    }
+                    'SizeMismatch' {
+                        $divergedCount++
+                        $csv.WriteLine('{0},Skip-Diverged,{1},{2},Size mismatch' -f (ConvertTo-CsvField $name), $srcType, $srcLen)
+                        $diverged.WriteLine('{0},{1},{2},{3},Size mismatch' -f (ConvertTo-CsvField $name), $srcType, $srcLen, $dstLen)
+                        if ($divergedSample.Count -lt 50) { $divergedSample.Add(("{0}  (source={1}, dest={2})" -f $name, (Format-FileSize $srcLen), (Format-FileSize $dstLen))) }
+                    }
+                    'Md5Mismatch' {
+                        $divergedCount++
+                        $csv.WriteLine('{0},Skip-Diverged,{1},{2},MD5 mismatch' -f (ConvertTo-CsvField $name), $srcType, $srcLen)
+                        $diverged.WriteLine('{0},{1},{2},{3},MD5 mismatch' -f (ConvertTo-CsvField $name), $srcType, $srcLen, $dstLen)
+                        if ($divergedSample.Count -lt 50) { $divergedSample.Add(("{0}  (source-md5={1}, dest-md5={2})" -f $name, $srcMd5, $dstMd5)) }
+                    }
+                    default {
+                        # 'Matched' or 'Matched (size only -- no MD5)'
+                        $inSyncCount++
+                    }
                 }
             }
 
@@ -263,9 +378,18 @@ function Build-MigrationPlan {
                     $batchNumber, $page.Count, $sourceCount, $copyCount, $inSyncCount, $divergedCount)
             }
         } while ($null -ne $token)
+
+        # A second streaming pass finds blobs that exist only in the destination, so the
+        # ledger matches the old pre-blob-status.csv (which included DestOnly rows).
+        if ($ledger) {
+            $destOnlyCount = Add-DestOnlyRows -DestContext $DestContext -DestContainer $DestContainer `
+                                              -SourceContext $SourceContext -SourceContainer $SourceContainer `
+                                              -BatchSize $BatchSize -LedgerWriter $ledger
+        }
     }
     finally {
         $csv.Dispose(); $copyList.Dispose(); $manifest.Dispose(); $diverged.Dispose()
+        if ($ledger) { $ledger.Dispose() }
     }
 
     return [pscustomobject]@{
@@ -274,10 +398,12 @@ function Build-MigrationPlan {
         CopyBytes      = $copyBytes
         DivergedCount  = $divergedCount
         InSyncCount    = $inSyncCount
+        DestOnlyCount  = $destOnlyCount
         PlanCsvPath    = $planCsvPath
         CopyListPath   = $copyListPath
         ManifestPath   = $manifestPath
         DivergedPath   = $divergedPath
+        StatusCsvPath  = $StatusCsvPath
         DivergedSample = $divergedSample
     }
 }
@@ -335,7 +461,7 @@ function Test-CopiedBlobs {
             $srcLen  = [long]$parts[1]
             $srcMd5  = if ($parts.Length -ge 3) { $parts[2] } else { '' }
 
-            $dst = Get-DestBlob -Context $DestContext -Container $DestContainer -BlobName $name
+            $dst = Get-BlobIfExists -Context $DestContext -Container $DestContainer -BlobName $name
             if ($null -eq $dst) {
                 $failed++
                 if ($failedSample.Count -lt 50) { $failedSample.Add("$name  (not present in destination)") }
@@ -436,17 +562,25 @@ Assert-ContainerExists -Context $destCtx -Container $DestContainer -AccountName 
 
 # ── PLAN ── stream the source, classify against the destination, write the plan to disk ─
 $step++; Write-Host "[$step/$totalSteps] Building migration plan (streaming, $BatchSize blob(s) per page)..."
+$preStatusCsv = if ($BlobStatusReport) { Join-Path $planDir 'pre-blob-status.csv' } else { '' }
 $plan = Build-MigrationPlan -SourceContext $sourceCtx -SourceContainer $SourceContainer `
                             -DestContext $destCtx -DestContainer $DestContainer `
-                            -BatchSize $BatchSize -PlanDirectory $planDir
+                            -BatchSize $BatchSize -PlanDirectory $planDir `
+                            -StatusCsvPath $preStatusCsv
 
 Write-Log 'PRE-MIGRATION PLAN -- what this run will do (source vs destination)'
 Write-Host ('Source blobs scanned:      {0}' -f $plan.SourceCount)
 Write-Host ('  To copy (missing):       {0}  ({1})' -f $plan.CopyCount, (Format-FileSize $plan.CopyBytes))
 Write-Host ('  Already in sync:         {0}' -f $plan.InSyncCount)
 Write-Host ('  Diverged (preserved):    {0}' -f $plan.DivergedCount)
+if ($BlobStatusReport) {
+    Write-Host ('  Destination-only:        {0} (preserved, not in source)' -f $plan.DestOnlyCount)
+}
 Write-Host ''
 Write-Host ('Plan written to: {0}' -f (Split-Path $plan.PlanCsvPath -Leaf))
+if ($BlobStatusReport) {
+    Write-Host ('Full per-blob ledger:  {0}' -f (Split-Path $plan.StatusCsvPath -Leaf))
+}
 
 if ($plan.DivergedCount -gt 0) {
     Write-Log 'DESTINATION DIVERGENCE DETECTED -- these blobs will NOT be copied, pipeline WILL fail'
@@ -504,6 +638,18 @@ if ($plan.CopyCount -gt 0 -and -not $azCopyError) {
             Write-Host (Colorize ('    ... and {0} more (see azcopy logs in {1})' -f ($validation.Failed - $validation.FailedSample.Count), $logDir) $script:Ansi.Red)
         }
     }
+}
+
+# ── POST-MIGRATION LEDGER ── full per-blob status after the copy (streamed, bounded memory) ─
+$postStatusCsv = ''
+if ($BlobStatusReport) {
+    $postStatusCsv = Join-Path $logDir 'post-blob-status.csv'
+    Write-Log 'POST-MIGRATION STATUS -- writing full per-blob ledger of the destination after copy'
+    $postDestOnly = Write-StatusLedger -SourceContext $sourceCtx -SourceContainer $SourceContainer `
+                                        -DestContext $destCtx -DestContainer $DestContainer `
+                                        -BatchSize $BatchSize -StatusCsvPath $postStatusCsv
+    Write-Host ('Per-blob ledger written to: {0}' -f (Split-Path $postStatusCsv -Leaf))
+    Write-Host ('Destination-only blobs:     {0} (preserved, not in source)' -f $postDestOnly)
 }
 
 # ── SUMMARY ─────────────────────────────────────────────────────────────────────
