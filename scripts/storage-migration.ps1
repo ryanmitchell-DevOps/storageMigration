@@ -45,6 +45,13 @@ param(
     # cheap; set to $false only if you don't want the files.
     [bool]$BlobStatusReport = $true,
 
+    # Cap how many missing blobs are copied in a single run (chunking). 0 = no limit (copy
+    # everything -- the default, unchanged for small containers). Set e.g. 25000 for a huge
+    # container: each run copies the next N missing blobs and DEFERS the rest, then reports
+    # PARTIAL. Re-run the pipeline until it reports nothing left -- already-copied blobs are
+    # skipped automatically, so it resumes where it left off.
+    [ValidateRange(0, 2147483647)][long]$MaxFilesPerRun = 0,
+
     [string]$LogDirectory
 )
 
@@ -255,9 +262,10 @@ function Invoke-ContainerMergeJoin {
         [System.IO.StreamWriter]$PlanWriter,      # migration-plan.csv rows (Copy / Skip-Diverged)
         [System.IO.StreamWriter]$CopyListWriter,  # azcopy --list-of-files (names only)
         [System.IO.StreamWriter]$LedgerWriter,    # full per-blob status ledger
+        [long]$MaxFilesPerRun = 0,                # cap on blobs added to the copy list (0 = no cap)
         [string]$ProgressLabel = 'scanned'
     )
-    $sourceCount = 0L; $copyCount = 0L; [long]$copyBytes = 0
+    $sourceCount = 0L; $copyCount = 0L; $deferredCount = 0L; [long]$copyBytes = 0
     $sizeMismatch = 0L; $md5Mismatch = 0L; $matched = 0L; $destOnly = 0L
     $divergedSample = [System.Collections.Generic.List[string]]::new()
     $scanned = 0L; $reportInterval = 5000L; $nextReport = $reportInterval
@@ -273,11 +281,19 @@ function Invoke-ContainerMergeJoin {
                else   { [string]::CompareOrdinal($src.Name, $dst.Name) }
 
         if ($cmp -lt 0) {
-            # Source only -> missing from destination -> copy it.
-            $sourceCount++; $copyCount++; $copyBytes += $src.Length
-            if ($PlanWriter)     { $PlanWriter.WriteLine(('{0},Copy,{1},{2},Missing from destination' -f (ConvertTo-CsvField $src.Name), $src.BlobType, $src.Length)) }
-            if ($CopyListWriter) { $CopyListWriter.WriteLine($src.Name) }
-            if ($LedgerWriter)   { $LedgerWriter.WriteLine(('{0},{1},{2},,{3},,Missing' -f (ConvertTo-CsvField $src.Name), $src.BlobType, $src.Length, $src.MD5)) }
+            # Source only -> missing from destination.
+            $sourceCount++
+            if ($MaxFilesPerRun -le 0 -or $copyCount -lt $MaxFilesPerRun) {
+                # Within this run's budget -> copy it now.
+                $copyCount++; $copyBytes += $src.Length
+                if ($PlanWriter)     { $PlanWriter.WriteLine(('{0},Copy,{1},{2},Missing from destination' -f (ConvertTo-CsvField $src.Name), $src.BlobType, $src.Length)) }
+                if ($CopyListWriter) { $CopyListWriter.WriteLine($src.Name) }
+            }
+            else {
+                # Over this run's cap -> leave it for a later run.
+                $deferredCount++
+            }
+            if ($LedgerWriter) { $LedgerWriter.WriteLine(('{0},{1},{2},,{3},,Missing' -f (ConvertTo-CsvField $src.Name), $src.BlobType, $src.Length, $src.MD5)) }
             $scanned++
             $src = Get-NextBlob $srcCur
         }
@@ -326,6 +342,7 @@ function Invoke-ContainerMergeJoin {
     [pscustomobject]@{
         SourceCount       = $sourceCount
         CopyCount         = $copyCount
+        DeferredCount     = $deferredCount
         CopyBytes         = $copyBytes
         InSyncCount       = $matched
         SizeMismatchCount = $sizeMismatch
@@ -348,7 +365,9 @@ function Build-MigrationPlan {
         [Parameter(Mandatory)][int]$BatchSize,
         [Parameter(Mandatory)][string]$PlanDirectory,
         # When set, also write the full per-blob ledger (every blob + DestOnly rows) here.
-        [string]$StatusCsvPath
+        [string]$StatusCsvPath,
+        # Cap on blobs copied this run (0 = no cap). The rest become DeferredCount.
+        [long]$MaxFilesPerRun = 0
     )
     $planCsvPath  = Join-Path $PlanDirectory 'migration-plan.csv'
     $copyListPath = Join-Path $PlanDirectory 'copy-list.txt'        # names only, for azcopy --list-of-files
@@ -365,7 +384,7 @@ function Build-MigrationPlan {
                                        -DestContext $DestContext -DestContainer $DestContainer `
                                        -BatchSize $BatchSize `
                                        -PlanWriter $csv -CopyListWriter $copyList -LedgerWriter $ledger `
-                                       -ProgressLabel 'scanned'
+                                       -MaxFilesPerRun $MaxFilesPerRun -ProgressLabel 'scanned'
     }
     finally {
         $csv.Dispose(); $copyList.Dispose()
@@ -375,6 +394,7 @@ function Build-MigrationPlan {
     [pscustomobject]@{
         SourceCount    = $r.SourceCount
         CopyCount      = $r.CopyCount
+        DeferredCount  = $r.DeferredCount
         CopyBytes      = $r.CopyBytes
         DivergedCount  = $r.DivergedCount
         InSyncCount    = $r.InSyncCount
@@ -475,6 +495,9 @@ try {
 Write-Log 'MIGRATION CONFIGURATION -- source and destination details for this run'
 Write-Host ('Start time:        {0:yyyy-MM-dd HH:mm:ss} UTC' -f $migrationStart)
 Write-Host ('Batch size:        {0} blob(s) per page' -f $BatchSize)
+if ($MaxFilesPerRun -gt 0) {
+    Write-Host ('Max files/run:     {0} (chunked -- re-run the pipeline until nothing remains)' -f $MaxFilesPerRun)
+}
 Write-Host ('Plan directory:    {0}' -f $planDir)
 Write-Host ('Log directory:     {0}' -f $logDir)
 Show-FreeSpace -Path $planDir
@@ -515,11 +538,14 @@ $preStatusCsv = if ($BlobStatusReport) { Join-Path $planDir 'pre-blob-status.csv
 $plan = Build-MigrationPlan -SourceContext $sourceCtx -SourceContainer $SourceContainer `
                             -DestContext $destCtx -DestContainer $DestContainer `
                             -BatchSize $BatchSize -PlanDirectory $planDir `
-                            -StatusCsvPath $preStatusCsv
+                            -StatusCsvPath $preStatusCsv -MaxFilesPerRun $MaxFilesPerRun
 
 Write-Log 'PRE-MIGRATION PLAN -- what this run will do (source vs destination)'
 Write-Host ('Source blobs scanned:      {0}' -f $plan.SourceCount)
-Write-Host ('  To copy (missing):       {0}  ({1})' -f $plan.CopyCount, (Format-FileSize $plan.CopyBytes))
+Write-Host ('  To copy (this run):      {0}  ({1})' -f $plan.CopyCount, (Format-FileSize $plan.CopyBytes))
+if ($plan.DeferredCount -gt 0) {
+    Write-Host (Colorize ('  Deferred (later runs):   {0} (over the {1}/run cap -- re-run to continue)' -f $plan.DeferredCount, $MaxFilesPerRun) $script:Ansi.Yellow)
+}
 Write-Host ('  Already in sync:         {0}' -f $plan.InSyncCount)
 Write-Host ('  Diverged (preserved):    {0}' -f $plan.DivergedCount)
 Write-Host ('  Destination-only:        {0} (preserved, not in source)' -f $plan.DestOnlyCount)
@@ -580,10 +606,6 @@ if ($plan.CopyCount -gt 0 -and -not $azCopyError) {
     $post = Get-PostMigrationStatus -SourceContext $sourceCtx -SourceContainer $SourceContainer `
                                     -DestContext $destCtx -DestContainer $DestContainer `
                                     -BatchSize $BatchSize -StatusCsvPath $postStatusCsv
-    Write-Host ('  Verified in destination: {0} of {1} copied' -f ($plan.CopyCount - $post.CopyCount), $plan.CopyCount)
-    if ($post.CopyCount -gt 0) {
-        Write-Host (Colorize ('  Failed (still missing):  {0}' -f $post.CopyCount) $script:Ansi.Red)
-    }
     if ($BlobStatusReport) {
         Write-Host ('  Post-migration ledger:   {0}' -f (Split-Path $postStatusCsv -Leaf))
         Write-Host ('  Destination-only blobs:  {0}' -f $post.DestOnlyCount)
@@ -591,24 +613,37 @@ if ($plan.CopyCount -gt 0 -and -not $azCopyError) {
 }
 
 # ── SUMMARY ─────────────────────────────────────────────────────────────────────
-$failedCount    = if ($post) { $post.CopyCount } else { 0 }
+# In chunked mode (-MaxFilesPerRun), the blobs still missing after a copy are the DEFERRED
+# ones (intended -- re-run to continue) plus any that actually failed to land. Anything
+# missing beyond the deferred count is a real copy failure.
+$deferred      = $plan.DeferredCount
+$stillMissing  = if ($post) { $post.CopyCount } else { $plan.DeferredCount }
+$failedCount   = [Math]::Max(0, $stillMissing - $deferred)
 $succeededCount = $plan.CopyCount - $failedCount
-$divergedFinal  = if ($post) { $post.DivergedCount } else { $plan.DivergedCount }
+$remaining     = $stillMissing                       # to be copied in future runs
+$divergedFinal = if ($post) { $post.DivergedCount } else { $plan.DivergedCount }
 
 Write-Log 'SUMMARY -- migration result'
 Write-Host ('Source blobs:        {0}' -f $plan.SourceCount)
 Write-Host ('Already in sync:     {0}' -f $plan.InSyncCount)
-Write-Host ('To copy:             {0}' -f $plan.CopyCount)
+Write-Host ('Copied this run:     {0}' -f $plan.CopyCount)
 if ($post) {
-    Write-Host ('  Migrated:          {0}' -f $succeededCount)
-    Write-Host ('  Failed:            {0}' -f $failedCount)
+    Write-Host ('  Verified:          {0}' -f $succeededCount)
+    if ($failedCount -gt 0) { Write-Host (Colorize ('  Failed:            {0}' -f $failedCount) $script:Ansi.Red) }
+}
+if ($remaining -gt 0 -and $failedCount -eq 0) {
+    Write-Host (Colorize ('Remaining (re-run):  {0}' -f $remaining) $script:Ansi.Yellow)
 }
 Write-Host ('Skipped (diverged):  {0}' -f $divergedFinal)
 
 $overallPass = (-not $azCopyError) -and ($failedCount -eq 0) -and ($divergedFinal -eq 0)
-Write-Host ("Validation:          {0}" -f $(if ($overallPass) { Colorize 'PASS' $script:Ansi.Green } else { Colorize 'FAIL' $script:Ansi.Red }))
+$resultText = if (-not $overallPass) { Colorize 'FAIL' $script:Ansi.Red }
+              elseif ($remaining -gt 0) { Colorize ('PARTIAL -- {0} copied, {1} remaining; re-run the pipeline to continue' -f $plan.CopyCount, $remaining) $script:Ansi.Yellow }
+              else { Colorize 'PASS' $script:Ansi.Green }
+Write-Host ("Result:              {0}" -f $resultText)
 
 # Throws happen after the summary so the operator sees the full picture before the step exits.
+# A non-zero $remaining (deferred) is NOT a failure -- the pipeline succeeds so you can re-run.
 if ($azCopyError) {
     Write-Log 'FAILURE: AZCOPY ERROR -- copy step reported a non-zero exit'
     Write-Host (Colorize $azCopyError.Exception.Message $script:Ansi.Red)
@@ -616,7 +651,7 @@ if ($azCopyError) {
 }
 if ($failedCount -gt 0) {
     Write-Log 'FAILURE: VALIDATION MISMATCH -- some copied blobs did not reach the destination'
-    throw "Validation failed: $failedCount copied blob(s) are still missing from '$DestContainer' after the copy. See azcopy logs in $logDir."
+    throw "Validation failed: $failedCount copied blob(s) are still missing from '$DestContainer' after the copy (beyond the $deferred deferred for later runs). See azcopy logs in $logDir."
 }
 if ($divergedFinal -gt 0) {
     Write-Log 'FAILURE: DESTINATION DIVERGENCE -- blobs differ from source and were preserved (not overwritten)'
