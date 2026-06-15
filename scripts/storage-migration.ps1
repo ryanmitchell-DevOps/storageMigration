@@ -298,12 +298,10 @@ function Build-MigrationPlan {
     $planCsvPath  = Join-Path $PlanDirectory 'migration-plan.csv'
     $copyListPath = Join-Path $PlanDirectory 'copy-list.txt'        # names only, for azcopy --list-of-files
     $manifestPath = Join-Path $PlanDirectory 'copy-manifest.tsv'    # name<TAB>size<TAB>md5, for post-copy validation
-    $divergedPath = Join-Path $PlanDirectory 'diverged.csv'
 
     $csv      = [System.IO.StreamWriter]::new($planCsvPath, $false)
     $copyList = [System.IO.StreamWriter]::new($copyListPath, $false)
     $manifest = [System.IO.StreamWriter]::new($manifestPath, $false)
-    $diverged = [System.IO.StreamWriter]::new($divergedPath, $false)
     $ledger   = if ($StatusCsvPath) { [System.IO.StreamWriter]::new($StatusCsvPath, $false) } else { $null }
 
     $sourceCount = 0L; $copyCount = 0L; $divergedCount = 0L; $inSyncCount = 0L; $destOnlyCount = 0L; [long]$copyBytes = 0
@@ -312,7 +310,6 @@ function Build-MigrationPlan {
 
     try {
         $csv.WriteLine('BlobName,Action,BlobType,SizeBytes,Reason')
-        $diverged.WriteLine('BlobName,BlobType,SourceSize,DestSize,Reason')
         if ($ledger) { $ledger.WriteLine('Name,BlobType,SourceSize,DestSize,SourceMD5,DestMD5,Status') }
 
         $token = $null
@@ -355,13 +352,11 @@ function Build-MigrationPlan {
                     'SizeMismatch' {
                         $divergedCount++
                         $csv.WriteLine(('{0},Skip-Diverged,{1},{2},Size mismatch' -f (ConvertTo-CsvField $name), $srcType, $srcLen))
-                        $diverged.WriteLine(('{0},{1},{2},{3},Size mismatch' -f (ConvertTo-CsvField $name), $srcType, $srcLen, $dstLen))
                         if ($divergedSample.Count -lt 50) { $divergedSample.Add(("{0}  (source={1}, dest={2})" -f $name, (Format-FileSize $srcLen), (Format-FileSize $dstLen))) }
                     }
                     'Md5Mismatch' {
                         $divergedCount++
                         $csv.WriteLine(('{0},Skip-Diverged,{1},{2},MD5 mismatch' -f (ConvertTo-CsvField $name), $srcType, $srcLen))
-                        $diverged.WriteLine(('{0},{1},{2},{3},MD5 mismatch' -f (ConvertTo-CsvField $name), $srcType, $srcLen, $dstLen))
                         if ($divergedSample.Count -lt 50) { $divergedSample.Add(("{0}  (source-md5={1}, dest-md5={2})" -f $name, $srcMd5, $dstMd5)) }
                     }
                     default {
@@ -388,7 +383,7 @@ function Build-MigrationPlan {
         }
     }
     finally {
-        $csv.Dispose(); $copyList.Dispose(); $manifest.Dispose(); $diverged.Dispose()
+        $csv.Dispose(); $copyList.Dispose(); $manifest.Dispose()
         if ($ledger) { $ledger.Dispose() }
     }
 
@@ -402,7 +397,6 @@ function Build-MigrationPlan {
         PlanCsvPath    = $planCsvPath
         CopyListPath   = $copyListPath
         ManifestPath   = $manifestPath
-        DivergedPath   = $divergedPath
         StatusCsvPath  = $StatusCsvPath
         DivergedSample = $divergedSample
     }
@@ -586,11 +580,11 @@ if ($plan.DivergedCount -gt 0) {
     Write-Log 'DESTINATION DIVERGENCE DETECTED -- these blobs will NOT be copied, pipeline WILL fail'
     Write-Host (Colorize ("{0} blob(s) in '{1}' differ from source by size or MD5 and will be preserved (NOT overwritten)." -f $plan.DivergedCount, $DestContainer) $script:Ansi.Red)
     Write-Host ('Missing blobs are still copied below, but the run fails at the end with these listed.')
-    Write-Host ('Full list: {0}' -f (Split-Path $plan.DivergedPath -Leaf))
+    Write-Host ('Full list: the Skip-Diverged rows in {0}' -f (Split-Path $plan.PlanCsvPath -Leaf))
     Write-Host ''
     $plan.DivergedSample | ForEach-Object { Write-Host (Colorize "  $_" $script:Ansi.Yellow) }
     if ($plan.DivergedCount -gt $plan.DivergedSample.Count) {
-        Write-Host ('  ... and {0} more (see {1})' -f ($plan.DivergedCount - $plan.DivergedSample.Count), (Split-Path $plan.DivergedPath -Leaf))
+        Write-Host ('  ... and {0} more (see the Skip-Diverged rows in {1})' -f ($plan.DivergedCount - $plan.DivergedSample.Count), (Split-Path $plan.PlanCsvPath -Leaf))
     }
 }
 
@@ -620,7 +614,7 @@ else {
     Write-Log 'DRY RUN (-WhatIf) -- no data copied. Review the published migration plan and approve to proceed.'
     Write-Host ('Migration plan:  {0}' -f $plan.PlanCsvPath)
     if ($plan.DivergedCount -gt 0) {
-        Write-Host ('Diverged blobs:  {0}' -f $plan.DivergedPath)
+        Write-Host ('Diverged blobs:  {0} Skip-Diverged row(s) in {1}' -f $plan.DivergedCount, $plan.PlanCsvPath)
     }
     return
 }
@@ -679,7 +673,7 @@ if ($validationFailed) {
 }
 if ($plan.DivergedCount -gt 0) {
     Write-Log 'FAILURE: DESTINATION DIVERGENCE -- blobs differ from source and were preserved (not overwritten)'
-    throw "Destination divergence: $($plan.DivergedCount) blob(s) in '$DestContainer' differ from source and were preserved. Reconcile manually (delete the diverged dest blob or fix the source) and re-run. See $($plan.DivergedPath)."
+    throw "Destination divergence: $($plan.DivergedCount) blob(s) in '$DestContainer' differ from source and were preserved. Reconcile manually (delete the diverged dest blob or fix the source) and re-run. See the Skip-Diverged rows in $($plan.PlanCsvPath)."
 }
 
 }
