@@ -223,8 +223,8 @@ function Add-DestOnlyRows {
             $src = Get-BlobIfExists -Context $SourceContext -Container $SourceContainer -BlobName $b.Name
             if ($null -eq $src) {
                 $destOnly++
-                $LedgerWriter.WriteLine('{0},{1},,{2},,{3},DestOnly' -f `
-                    (ConvertTo-CsvField $b.Name), [string]$b.BlobType, [long]$b.Length, (Get-BlobMd5 $b))
+                $LedgerWriter.WriteLine(('{0},{1},,{2},,{3},DestOnly' -f `
+                    (ConvertTo-CsvField $b.Name), [string]$b.BlobType, [long]$b.Length, (Get-BlobMd5 $b)))
             }
         }
     } while ($null -ne $token)
@@ -263,9 +263,9 @@ function Write-StatusLedger {
                 $dstMd5 = if ($dst) { Get-BlobMd5 $dst } else { $null }
                 $status = Resolve-BlobStatus -Dst $dst -SrcLen $srcLen -SrcMd5 $srcMd5 -DstLen $dstLen -DstMd5 $dstMd5
                 if ($null -eq $dst) {
-                    $w.WriteLine('{0},{1},{2},,{3},,{4}' -f (ConvertTo-CsvField $b.Name), [string]$b.BlobType, $srcLen, $srcMd5, $status)
+                    $w.WriteLine(('{0},{1},{2},,{3},,{4}' -f (ConvertTo-CsvField $b.Name), [string]$b.BlobType, $srcLen, $srcMd5, $status))
                 } else {
-                    $w.WriteLine('{0},{1},{2},{3},{4},{5},{6}' -f (ConvertTo-CsvField $b.Name), [string]$b.BlobType, $srcLen, $dstLen, $srcMd5, $dstMd5, $status)
+                    $w.WriteLine(('{0},{1},{2},{3},{4},{5},{6}' -f (ConvertTo-CsvField $b.Name), [string]$b.BlobType, $srcLen, $dstLen, $srcMd5, $dstMd5, $status))
                 }
             }
         } while ($null -ne $token)
@@ -339,29 +339,29 @@ function Build-MigrationPlan {
 
                 if ($ledger) {
                     if ($null -eq $dst) {
-                        $ledger.WriteLine('{0},{1},{2},,{3},,{4}' -f (ConvertTo-CsvField $name), $srcType, $srcLen, $srcMd5, $status)
+                        $ledger.WriteLine(('{0},{1},{2},,{3},,{4}' -f (ConvertTo-CsvField $name), $srcType, $srcLen, $srcMd5, $status))
                     } else {
-                        $ledger.WriteLine('{0},{1},{2},{3},{4},{5},{6}' -f (ConvertTo-CsvField $name), $srcType, $srcLen, $dstLen, $srcMd5, $dstMd5, $status)
+                        $ledger.WriteLine(('{0},{1},{2},{3},{4},{5},{6}' -f (ConvertTo-CsvField $name), $srcType, $srcLen, $dstLen, $srcMd5, $dstMd5, $status))
                     }
                 }
 
                 switch ($status) {
                     'Missing' {
                         $copyCount++; $copyBytes += $srcLen
-                        $csv.WriteLine('{0},Copy,{1},{2},Missing from destination' -f (ConvertTo-CsvField $name), $srcType, $srcLen)
+                        $csv.WriteLine(('{0},Copy,{1},{2},Missing from destination' -f (ConvertTo-CsvField $name), $srcType, $srcLen))
                         $copyList.WriteLine($name)
                         $manifest.WriteLine(("{0}`t{1}`t{2}" -f $name, $srcLen, $srcMd5))
                     }
                     'SizeMismatch' {
                         $divergedCount++
-                        $csv.WriteLine('{0},Skip-Diverged,{1},{2},Size mismatch' -f (ConvertTo-CsvField $name), $srcType, $srcLen)
-                        $diverged.WriteLine('{0},{1},{2},{3},Size mismatch' -f (ConvertTo-CsvField $name), $srcType, $srcLen, $dstLen)
+                        $csv.WriteLine(('{0},Skip-Diverged,{1},{2},Size mismatch' -f (ConvertTo-CsvField $name), $srcType, $srcLen))
+                        $diverged.WriteLine(('{0},{1},{2},{3},Size mismatch' -f (ConvertTo-CsvField $name), $srcType, $srcLen, $dstLen))
                         if ($divergedSample.Count -lt 50) { $divergedSample.Add(("{0}  (source={1}, dest={2})" -f $name, (Format-FileSize $srcLen), (Format-FileSize $dstLen))) }
                     }
                     'Md5Mismatch' {
                         $divergedCount++
-                        $csv.WriteLine('{0},Skip-Diverged,{1},{2},MD5 mismatch' -f (ConvertTo-CsvField $name), $srcType, $srcLen)
-                        $diverged.WriteLine('{0},{1},{2},{3},MD5 mismatch' -f (ConvertTo-CsvField $name), $srcType, $srcLen, $dstLen)
+                        $csv.WriteLine(('{0},Skip-Diverged,{1},{2},MD5 mismatch' -f (ConvertTo-CsvField $name), $srcType, $srcLen))
+                        $diverged.WriteLine(('{0},{1},{2},{3},MD5 mismatch' -f (ConvertTo-CsvField $name), $srcType, $srcLen, $dstLen))
                         if ($divergedSample.Count -lt 50) { $divergedSample.Add(("{0}  (source-md5={1}, dest-md5={2})" -f $name, $srcMd5, $dstMd5)) }
                     }
                     default {
