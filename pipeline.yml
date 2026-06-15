@@ -6,7 +6,7 @@ variables:
 
 
 pool:
-  name: caf-pool-ftdairynetcloudpro1dc3
+  name: 
 
 stages:
   - stage: StorageMigration
