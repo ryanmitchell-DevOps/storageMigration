@@ -51,7 +51,7 @@ function Initialize-LogDirectory {
     }
     else { $dir = Join-Path ([IO.Path]::GetTempPath()) "azcopy-logs-$(Get-Date -Format yyyyMMddHHmmss)" }
 
-    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force -WhatIf:$false | Out-Null }
     return $dir
 }
 
@@ -215,7 +215,7 @@ function Show-BlobList {
         $lines = $sorted | ForEach-Object { 
             ('{0,-80} {1,-12} {2,15}' -f $_, $SizeSource[$_].BlobType, (Format-FileSize $SizeSource[$_].Length))
         }
-        Set-Content -Path $FilePath -Value $lines
+        Set-Content -Path $FilePath -Value $lines -WhatIf:$false
     }
 }
 
@@ -387,7 +387,7 @@ function Show-MigrationStatus {
             Status     = 'DestOnly'
         })
     }
-    $rows | Export-Csv -NoTypeInformation -Path $csvPath
+    $rows | Export-Csv -NoTypeInformation -Path $csvPath -WhatIf:$false
     Write-Host ''
     Write-Host ('Per-blob status written to: {0}' -f (Split-Path $csvPath -Leaf))
 }
@@ -533,13 +533,13 @@ Write-Log 'PREPARATION CHECKS -- verifying storage accounts, containers, and inv
 $step = 0; $totalSteps = 3
 
 $step++; Write-Host "[$step/$totalSteps] Verifying source storage account and container exist..."
-$null = Set-AzContext -SubscriptionId $SourceSubscriptionId -WarningAction SilentlyContinue
+$srcContext = Set-AzContext -SubscriptionId $SourceSubscriptionId -ErrorAction Stop -WarningAction SilentlyContinue -WhatIf:$false
 Assert-StorageAccountExists -AccountName $SourceStorageAccount
 $sourceCtx = New-AzStorageContext -StorageAccountName $SourceStorageAccount -UseConnectedAccount
 Assert-ContainerExists -Context $sourceCtx -Container $SourceContainer -AccountName $SourceStorageAccount
 
 $step++; Write-Host "[$step/$totalSteps] Verifying destination storage account and container exist..."
-$null = Set-AzContext -SubscriptionId $DestSubscriptionId -WarningAction SilentlyContinue
+$null = Set-AzContext -SubscriptionId $DestSubscriptionId -ErrorAction Stop -WarningAction SilentlyContinue -WhatIf:$false
 Assert-StorageAccountExists -AccountName $DestStorageAccount
 $destCtx = New-AzStorageContext -StorageAccountName $DestStorageAccount -UseConnectedAccount
 Assert-ContainerExists -Context $destCtx -Container $DestContainer -AccountName $DestStorageAccount
@@ -641,6 +641,45 @@ elseif ($PSCmdlet.ShouldProcess(
 }
 else {
     Write-Warning 'Dry run (-WhatIf) -- no data copied.'
+
+    $planDir = if ($env:BUILD_ARTIFACTSTAGINGDIRECTORY) {
+        Join-Path $env:BUILD_ARTIFACTSTAGINGDIRECTORY 'migration-plan'
+    } else {
+        Join-Path ([IO.Path]::GetTempPath()) 'migration-plan'
+    }
+    if (-not (Test-Path $planDir)) { New-Item -ItemType Directory -Path $planDir -Force -WhatIf:$false | Out-Null }
+
+    $planFile = Join-Path $planDir 'migration-plan.csv'
+    $rows = [System.Collections.Generic.List[object]]::new()
+    foreach ($name in ($preStatus.PendingNames | Sort-Object)) {
+        $blob = $sourceInventory[$name]
+        $rows.Add([pscustomobject]@{
+            BlobName        = $name
+            Action          = 'Copy'
+            BlobType        = $blob.BlobType
+            SizeBytes       = $blob.Length
+            SourceAccount   = $SourceStorageAccount
+            SourceContainer = $SourceContainer
+            DestAccount     = $DestStorageAccount
+            DestContainer   = $DestContainer
+        })
+    }
+    foreach ($name in ($preStatus.SizeMismatchNames + $preStatus.Md5MismatchNames | Sort-Object)) {
+        $blob = $sourceInventory[$name]
+        $rows.Add([pscustomobject]@{
+            BlobName        = $name
+            Action          = 'Skip-Diverged'
+            BlobType        = $blob.BlobType
+            SizeBytes       = $blob.Length
+            SourceAccount   = $SourceStorageAccount
+            SourceContainer = $SourceContainer
+            DestAccount     = $DestStorageAccount
+            DestContainer   = $DestContainer
+        })
+    }
+    $rows | Export-Csv -Path $planFile -NoTypeInformation -Encoding utf8 -WhatIf:$false
+
+    Write-Host "Migration plan written to: $planFile"
     return
 }
 
