@@ -3,18 +3,10 @@ trigger: none
 name: storage-migration_$(Date:yyyyMMdd)$(Rev:.r)
 
 variables:
-  # Dev env variables - update as needed per stage and container changes
-  # TODO: Consider parameterizing in future 
-  serviceConnection: 'FT-DairyNet-Cloud-PROD-001-CICD'
-  sourceSubscriptionId: '3cd7b099-993c-4d72-bc13-1408376a88a6'
-  sourceStorageAccount: 'dncstorage33cdprd'
-  sourceContainer: 'dnc-dataexplorer-prd'
-  destSubscriptionId: '1dc32f4d-fc9d-4077-a568-777d2ccfcdb2'
-  destStorageAccount: 'stdncstorage3ok0r'
-  destContainer: 'data-migration-trial-prd'
+
 
 pool:
-  name: caf-pool-ftdairynetcloudpro1dc3
+  name: 
 
 stages:
   - stage: StorageMigration
