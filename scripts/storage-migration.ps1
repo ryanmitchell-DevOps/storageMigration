@@ -200,6 +200,7 @@ function Build-MigrationPlan {
     $diverged = [System.IO.StreamWriter]::new($divergedPath, $false)
 
     $sourceCount = 0L; $copyCount = 0L; $divergedCount = 0L; $inSyncCount = 0L; [long]$copyBytes = 0
+    $batchNumber = 0L
     $divergedSample = [System.Collections.Generic.List[string]]::new()
 
     try {
@@ -212,6 +213,7 @@ function Build-MigrationPlan {
                         -MaxCount $BatchSize -ContinuationToken $token -ErrorAction Stop)
             if ($page.Count -eq 0) { break }
 
+            $batchNumber++
             $last = $page[$page.Count - 1]
             $token = if ($last.PSObject.Properties['ContinuationToken']) { $last.ContinuationToken } else { $null }
 
@@ -254,8 +256,11 @@ function Build-MigrationPlan {
                 }
             }
 
-            if ($sourceCount % ([long]$BatchSize * 100) -lt $page.Count) {
-                Write-Host ('       scanned {0} source blob(s)...' -f $sourceCount)
+            # Show the first 10 batches in full so you can watch the paging happen,
+            # then throttle to roughly every 2,000 blobs so large runs don't flood the log.
+            if ($batchNumber -le 10 -or ($sourceCount % ([long]$BatchSize * 100) -lt $page.Count)) {
+                Write-Host ('       [batch {0}] {1} blob(s) this page, {2} scanned so far (copy {3}, in-sync {4}, diverged {5})' -f `
+                    $batchNumber, $page.Count, $sourceCount, $copyCount, $inSyncCount, $divergedCount)
             }
         } while ($null -ne $token)
     }
