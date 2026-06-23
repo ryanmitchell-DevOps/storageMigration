@@ -1,31 +1,6 @@
 #Requires -Version 7.0
 #Requires -Modules Az.Accounts, @{ ModuleName='Az.Storage'; ModuleVersion='6.0.0' }
 
-<#
-.SYNOPSIS
-    Memory-safe, streaming container-to-container blob migration with a review/approve gate.
-
-.DESCRIPTION
-    Earlier versions inventoried BOTH containers fully into in-memory dictionaries before
-    diffing. On large production containers that exhausted the agent's RAM (the
-    "Free memory is lower than 5%" warnings) and the job was killed.
-
-    This version compares the two containers with a streaming MERGE-JOIN. Azure returns blob
-    listings already sorted by name, so the source and destination are each bulk-listed in
-    pages (-BatchSize) and walked side by side: matching names are compared (size + MD5),
-    source-only names are "missing" (to copy), destination-only names are "DestOnly". Only the
-    current page of each container is ever in memory (a few MB), so it cannot crash the agent
-    no matter how many blobs there are -- and there are no per-blob lookups, so it's fast.
-
-    Flow (mirrors the pipeline's plan -> approve -> migrate jobs):
-      1. -WhatIf  : merge-join the two containers, write migration-plan.csv (+ copy list and,
-                    optionally, the full pre-blob-status.csv ledger), then stop. Nothing copied.
-      2. (human approves the published plan artifact)
-      3. real run : same merge-join, hand the copy list to a single azcopy job (azcopy streams
-                    it with bounded memory), then merge-join again to validate and write the
-                    post-blob-status.csv ledger, and fail on any divergence or failed copy.
-#>
-
 [CmdletBinding(SupportsShouldProcess)]
 param(
     [Parameter(Mandatory)][string]$SourceSubscriptionId,
@@ -46,10 +21,6 @@ param(
     [bool]$BlobStatusReport = $true,
 
     # Cap how many missing blobs are copied in a single run (chunking). 0 = no limit (copy
-    # everything -- the default, unchanged for small containers). Set e.g. 25000 for a huge
-    # container: each run copies the next N missing blobs and DEFERS the rest, then reports
-    # PARTIAL. Re-run the pipeline until it reports nothing left -- already-copied blobs are
-    # skipped automatically, so it resumes where it left off.
     [ValidateRange(0, 2147483647)][long]$MaxFilesPerRun = 0,
 
     [string]$LogDirectory
@@ -247,10 +218,6 @@ function Get-NextBlob {
     }
 }
 
-# Walks the source and destination containers side by side (merge-join over two sorted, bulk-
-# listed streams) and classifies every blob. Writes plan rows / copy list / ledger rows to
-# whichever StreamWriters are supplied. Holds only one page per container -- flat memory,
-# no per-blob lookups. Returns counters and a sample of diverged blobs.
 function Invoke-ContainerMergeJoin {
     [OutputType([pscustomobject])]
     param(
