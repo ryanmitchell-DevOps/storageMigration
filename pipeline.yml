@@ -8,6 +8,11 @@ parameters:
     type: number
     default: 0
 
+  - name: copyEntireContainer
+    displayName: 'First run into an EMPTY destination: copy the whole container (skips the merge-join scan; no validation). Re-run with this OFF afterwards to reconcile & validate.'
+    type: boolean
+    default: false
+
 variables:
 
 
@@ -43,13 +48,15 @@ stages:
                 -DestStorageAccount '$(destStorageAccount)'
                 -DestContainer '$(destContainer)'
                 -MaxFilesPerRun ${{ parameters.maxFilesPerRun }}
+                -CopyEntireContainer:$${{ parameters.copyEntireContainer }}
                 -WhatIf
               azurePowerShellVersion: LatestVersion
               pwsh: true
 
           - task: PublishPipelineArtifact@1
             displayName: 'Publish migration plan'
-            condition: always()
+            # Fast path writes no plan -- only publish in normal (merge-join) mode.
+            condition: and(always(), eq('${{ parameters.copyEntireContainer }}', 'False'))
             inputs:
               targetPath: '$(Build.ArtifactStagingDirectory)/migration-plan'
               artifact: 'migration-plan'
@@ -92,6 +99,7 @@ stages:
                 -DestStorageAccount '$(destStorageAccount)'
                 -DestContainer '$(destContainer)'
                 -MaxFilesPerRun ${{ parameters.maxFilesPerRun }}
+                -CopyEntireContainer:$${{ parameters.copyEntireContainer }}
               azurePowerShellVersion: LatestVersion
               pwsh: true
 

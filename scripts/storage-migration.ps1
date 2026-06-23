@@ -23,6 +23,13 @@ param(
     # Cap how many missing blobs are copied in a single run (chunking). 0 = no limit (copy
     [ValidateRange(0, 2147483647)][long]$MaxFilesPerRun = 0,
 
+    # First-run fast path for an EMPTY destination: skip the merge-join plan entirely and have
+    # azcopy copy the WHOLE container recursively (it lists and copies in one streamed pass,
+    # far faster than pre-scanning every source blob when all of them are going to be copied
+    # anyway). No divergence check or validation is done -- re-run WITHOUT this switch afterwards
+    # to reconcile anything missed and write the validation ledger.
+    [switch]$CopyEntireContainer,
+
     [string]$LogDirectory
 )
 
@@ -400,21 +407,25 @@ function Get-PostMigrationStatus {
 
 # Runs a single azcopy job over the whole copy list. azcopy streams the list file and keeps
 # its job plan on disk, so memory stays bounded no matter how many blobs are listed.
-function Invoke-AzCopyByListFile {
+function Invoke-AzCopy {
     param(
         [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$SourceAccount,
         [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$SourceContainer,
         [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$DestAccount,
         [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$DestContainer,
-        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$ListFile
+        # Names-only copy list for an incremental run. Omit to copy the WHOLE container
+        # recursively (the empty-destination fast path -- azcopy lists and copies in one pass).
+        [string]$ListFile
     )
     $sourceUrl = "https://$SourceAccount.blob.core.windows.net/$SourceContainer"
     $destUrl   = "https://$DestAccount.blob.core.windows.net/$DestContainer"
 
+    $azCopyArgs = @('copy', $sourceUrl, $destUrl, '--s2s-preserve-blob-tags')
+    if ($ListFile) { $azCopyArgs += @('--list-of-files', $ListFile) }
+    else           { $azCopyArgs += '--recursive' }
+
     $state = @{ LastProgress = [datetime]::UtcNow }
-    & azcopy copy $sourceUrl $destUrl `
-         --list-of-files $ListFile `
-         --s2s-preserve-blob-tags 2>&1 | ForEach-Object {
+    & azcopy @azCopyArgs 2>&1 | ForEach-Object {
         if ("$_".Trim() -match '^\d+(\.\d+)?\s*%') {
             $now = [datetime]::UtcNow
             if (($now - $state.LastProgress).TotalSeconds -lt 60) { return }
@@ -450,6 +461,10 @@ $logDir  = Initialize-Directory -Path $logDir
 $env:AZCOPY_AUTO_LOGIN_TYPE   = 'PSCRED'
 $env:AZCOPY_LOG_LOCATION      = $logDir
 $env:AZCOPY_JOB_PLAN_LOCATION = $logDir
+# Open more parallel transfers than azcopy's core-count default (~32 on a 2-vCPU agent).
+# The copy is Azure-to-Azure (S2S), so the account bandwidth, not the agent, is the real
+# limit -- raising this uses bandwidth that the cautious default leaves idle.
+$env:AZCOPY_CONCURRENCY_VALUE = '256'
 
 if (-not (Get-Command azcopy -ErrorAction SilentlyContinue)) {
     throw 'azcopy executable not found in PATH. Install it on the agent (e.g. via the AzureCLI@2 task or a dedicated AzCopy install step) before running this script.'
@@ -499,6 +514,29 @@ Assert-StorageAccountExists -AccountName $DestStorageAccount
 $destCtx = New-AzStorageContext -StorageAccountName $DestStorageAccount -UseConnectedAccount
 Assert-ContainerExists -Context $destCtx -Container $DestContainer -AccountName $DestStorageAccount
 
+# ── FAST PATH ── empty destination: copy the whole container, skip planning/validation ──
+# For the very first run into an EMPTY destination, every blob is going to be copied anyway,
+# so the full source merge-join is pure dead time. azcopy lists and copies the whole container
+# in one streamed pass instead. Re-run WITHOUT -CopyEntireContainer afterwards to reconcile
+# anything missed and write the validation ledger.
+if ($CopyEntireContainer) {
+    Write-Log 'COPY ENTIRE CONTAINER -- empty-destination fast path (no merge-join, no validation)'
+    Write-Host 'Skipping plan, divergence and validation. Re-run in normal mode afterwards to catch anything missed and validate.'
+
+    if ($PSCmdlet.ShouldProcess("entire '$SourceContainer' container", "Copy to $DestStorageAccount/$DestContainer")) {
+        Write-Log ('MIGRATING -- copying the entire {0} container to {1} (recursive)' -f $SourceContainer, $DestContainer)
+        Invoke-AzCopy -SourceAccount $SourceStorageAccount -SourceContainer $SourceContainer `
+                      -DestAccount $DestStorageAccount -DestContainer $DestContainer
+        Write-Log 'SUMMARY -- entire-container copy finished'
+        Write-Host (Colorize 'azcopy reported success for every transfer (see the azcopy log for the per-file breakdown).' $script:Ansi.Green)
+        Write-Host 'Next: re-run this script WITHOUT -CopyEntireContainer to reconcile anything missed and write the validation ledger.'
+    }
+    else {
+        Write-Log 'DRY RUN (-WhatIf) -- no data copied. Remove -WhatIf (or approve) to copy the whole container.'
+    }
+    return
+}
+
 # ── PLAN ── merge-join the two containers and write the plan to disk ─────────────
 $step++; Write-Host "[$step/$totalSteps] Building migration plan (merge-join, $BatchSize blob(s) per page)..."
 $preStatusCsv = if ($BlobStatusReport) { Join-Path $planDir 'pre-blob-status.csv' } else { '' }
@@ -546,9 +584,9 @@ elseif ($PSCmdlet.ShouldProcess(
 
     Write-Log ('MIGRATING -- copying {0} blob(s) ({1}) from {2} to {3}' -f $plan.CopyCount, (Format-FileSize $plan.CopyBytes), $SourceContainer, $DestContainer)
     try {
-        Invoke-AzCopyByListFile -SourceAccount $SourceStorageAccount -SourceContainer $SourceContainer `
-                                -DestAccount $DestStorageAccount -DestContainer $DestContainer `
-                                -ListFile $plan.CopyListPath
+        Invoke-AzCopy -SourceAccount $SourceStorageAccount -SourceContainer $SourceContainer `
+                      -DestAccount $DestStorageAccount -DestContainer $DestContainer `
+                      -ListFile $plan.CopyListPath
     }
     catch {
         $azCopyError = $_
