@@ -23,89 +23,131 @@ stages:
   - stage: StorageMigration
     displayName: 'Container Storage Migration'
     jobs:
-      - job: MigrationPlan
-        displayName: 'Inventory & Preview'
-        timeoutInMinutes: 240   # 4h cap; merge-join plans large containers in minutes
-        workspace:
-          clean: all
-        steps:
-          - checkout: self
 
-          - template: ../migrations/storage/install-migration-tools.yml
+      # ── NORMAL PATH ── merge-join preview -> manual approval -> migrate ──────────
+      # Runs only when NOT copying the whole container. The switch is omitted entirely
+      # (never passed as a boolean value), so nothing can break off into a stray arg.
+      - ${{ if eq(parameters.copyEntireContainer, false) }}:
+        - job: MigrationPlan
+          displayName: 'Inventory & Preview'
+          timeoutInMinutes: 240   # 4h cap; merge-join plans large containers in minutes
+          workspace:
+            clean: all
+          steps:
+            - checkout: self
 
-          # Preview migration with -WhatIf
-          - task: AzurePowerShell@5
-            displayName: 'Preview Storage Migration (-WhatIf)'
-            inputs:
-              azureSubscription: $(serviceConnection)
-              ScriptType: FilePath
-              ScriptPath: migrations/storage/storage-migration.ps1
-              ScriptArguments: >-
-                -SourceSubscriptionId '$(sourceSubscriptionId)'
-                -SourceStorageAccount '$(sourceStorageAccount)'
-                -SourceContainer '$(sourceContainer)'
-                -DestSubscriptionId '$(destSubscriptionId)'
-                -DestStorageAccount '$(destStorageAccount)'
-                -DestContainer '$(destContainer)'
-                -MaxFilesPerRun ${{ parameters.maxFilesPerRun }}
-                -CopyEntireContainer:$${{ parameters.copyEntireContainer }}
-                -WhatIf
-              azurePowerShellVersion: LatestVersion
-              pwsh: true
+            - template: ../migrations/storage/install-migration-tools.yml
 
-          - task: PublishPipelineArtifact@1
-            displayName: 'Publish migration plan'
-            # Fast path writes no plan -- only publish in normal (merge-join) mode.
-            condition: and(always(), eq('${{ parameters.copyEntireContainer }}', 'False'))
-            inputs:
-              targetPath: '$(Build.ArtifactStagingDirectory)/migration-plan'
-              artifact: 'migration-plan'
+            # Preview migration with -WhatIf
+            - task: AzurePowerShell@5
+              displayName: 'Preview Storage Migration (-WhatIf)'
+              inputs:
+                azureSubscription: $(serviceConnection)
+                ScriptType: FilePath
+                ScriptPath: migrations/storage/storage-migration.ps1
+                ScriptArguments: >-
+                  -SourceSubscriptionId '$(sourceSubscriptionId)'
+                  -SourceStorageAccount '$(sourceStorageAccount)'
+                  -SourceContainer '$(sourceContainer)'
+                  -DestSubscriptionId '$(destSubscriptionId)'
+                  -DestStorageAccount '$(destStorageAccount)'
+                  -DestContainer '$(destContainer)'
+                  -MaxFilesPerRun ${{ parameters.maxFilesPerRun }}
+                  -WhatIf
+                azurePowerShellVersion: LatestVersion
+                pwsh: true
 
-      - job: ManualApproval
-        displayName: 'Approve Plan'
-        dependsOn: MigrationPlan
-        pool: server
-        steps:
-          - task: ManualValidation@1
-            inputs:
-              notifyUsers: ''
-              instructions: 'Review the migration plan and approve to proceed with the migration.'
-              onTimeout: 'reject'
-              timeout: '1440' # 1 day
+            - task: PublishPipelineArtifact@1
+              displayName: 'Publish migration plan'
+              condition: always()
+              inputs:
+                targetPath: '$(Build.ArtifactStagingDirectory)/migration-plan'
+                artifact: 'migration-plan'
 
-      - job: MigrateStorageContainer
-        displayName: 'Migrate Storage Container'
-        timeoutInMinutes: 1440  # 24h cap; the 900k server-to-server copy can run for hours
-        dependsOn: ManualApproval
-        workspace:
-          clean: all
-        steps:
-          - checkout: self
+        - job: ManualApproval
+          displayName: 'Approve Plan'
+          dependsOn: MigrationPlan
+          pool: server
+          steps:
+            - task: ManualValidation@1
+              inputs:
+                notifyUsers: ''
+                instructions: 'Review the migration plan and approve to proceed with the migration.'
+                onTimeout: 'reject'
+                timeout: '1440' # 1 day
 
-          - template: ../migrations/storage/install-migration-tools.yml
+        - job: MigrateStorageContainer
+          displayName: 'Migrate Storage Container'
+          timeoutInMinutes: 1440  # 24h cap; the 900k server-to-server copy can run for hours
+          dependsOn: ManualApproval
+          workspace:
+            clean: all
+          steps:
+            - checkout: self
 
-          # Execute migration
-          - task: AzurePowerShell@5
-            displayName: 'Execute Storage Migration'
-            inputs:
-              azureSubscription: $(serviceConnection)
-              ScriptType: FilePath
-              ScriptPath: migrations/storage/storage-migration.ps1
-              ScriptArguments: >-
-                -SourceSubscriptionId '$(sourceSubscriptionId)'
-                -SourceStorageAccount '$(sourceStorageAccount)'
-                -SourceContainer '$(sourceContainer)'
-                -DestSubscriptionId '$(destSubscriptionId)'
-                -DestStorageAccount '$(destStorageAccount)'
-                -DestContainer '$(destContainer)'
-                -MaxFilesPerRun ${{ parameters.maxFilesPerRun }}
-                -CopyEntireContainer:$${{ parameters.copyEntireContainer }}
-              azurePowerShellVersion: LatestVersion
-              pwsh: true
+            - template: ../migrations/storage/install-migration-tools.yml
 
-          - task: PublishPipelineArtifact@1
-            displayName: 'Publish azcopy logs'
-            condition: always()
-            inputs:
-              targetPath: '$(Build.ArtifactStagingDirectory)/azcopy-logs'
-              artifact: 'azcopy-logs'
+            # Execute migration (merge-join: copy missing, validate after)
+            - task: AzurePowerShell@5
+              displayName: 'Execute Storage Migration'
+              inputs:
+                azureSubscription: $(serviceConnection)
+                ScriptType: FilePath
+                ScriptPath: migrations/storage/storage-migration.ps1
+                ScriptArguments: >-
+                  -SourceSubscriptionId '$(sourceSubscriptionId)'
+                  -SourceStorageAccount '$(sourceStorageAccount)'
+                  -SourceContainer '$(sourceContainer)'
+                  -DestSubscriptionId '$(destSubscriptionId)'
+                  -DestStorageAccount '$(destStorageAccount)'
+                  -DestContainer '$(destContainer)'
+                  -MaxFilesPerRun ${{ parameters.maxFilesPerRun }}
+                azurePowerShellVersion: LatestVersion
+                pwsh: true
+
+            - task: PublishPipelineArtifact@1
+              displayName: 'Publish azcopy logs'
+              condition: always()
+              inputs:
+                targetPath: '$(Build.ArtifactStagingDirectory)/azcopy-logs'
+                artifact: 'azcopy-logs'
+
+      # ── FAST PATH ── empty destination: copy the whole container immediately ─────
+      # Runs only when copying the whole container. No preview, no approval. The switch
+      # is hard-coded literally (present, not a boolean), so the binding bug can't recur.
+      - ${{ if eq(parameters.copyEntireContainer, true) }}:
+        - job: MigrateStorageContainer
+          displayName: 'Migrate Storage Container (entire container)'
+          timeoutInMinutes: 1440  # 24h cap; the 900k server-to-server copy can run for hours
+          workspace:
+            clean: all
+          steps:
+            - checkout: self
+
+            - template: ../migrations/storage/install-migration-tools.yml
+
+            # Execute migration (fast path: copy the whole container recursively, no validation)
+            - task: AzurePowerShell@5
+              displayName: 'Execute Storage Migration (entire container)'
+              inputs:
+                azureSubscription: $(serviceConnection)
+                ScriptType: FilePath
+                ScriptPath: migrations/storage/storage-migration.ps1
+                ScriptArguments: >-
+                  -SourceSubscriptionId '$(sourceSubscriptionId)'
+                  -SourceStorageAccount '$(sourceStorageAccount)'
+                  -SourceContainer '$(sourceContainer)'
+                  -DestSubscriptionId '$(destSubscriptionId)'
+                  -DestStorageAccount '$(destStorageAccount)'
+                  -DestContainer '$(destContainer)'
+                  -MaxFilesPerRun ${{ parameters.maxFilesPerRun }}
+                  -CopyEntireContainer
+                azurePowerShellVersion: LatestVersion
+                pwsh: true
+
+            - task: PublishPipelineArtifact@1
+              displayName: 'Publish azcopy logs'
+              condition: always()
+              inputs:
+                targetPath: '$(Build.ArtifactStagingDirectory)/azcopy-logs'
+                artifact: 'azcopy-logs'
