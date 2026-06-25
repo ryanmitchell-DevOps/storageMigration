@@ -1,27 +1,37 @@
-##[section]PREPARATION CHECKS -- verifying storage accounts and containers before migration
-2026-06-15T10:50:00.2587709Z [1/3] Verifying source storage account and container exist...
-2026-06-15T10:50:02.3755163Z Storage account 'dncstorage33cdprd' found in subscription '3cd7b099-993c-4d72-bc13-1408376a88a6'.
-2026-06-15T10:50:02.6594485Z Container 'dnc-directmethod-lib-prd' found in 'dncstorage33cdprd'.
-2026-06-15T10:50:02.6633240Z [2/3] Verifying destination storage account and container exist...
-2026-06-15T10:50:03.5771457Z Storage account 'stdncstorage3ok0r' found in subscription '1dc32f4d-fc9d-4077-a568-777d2ccfcdb2'.
-2026-06-15T10:50:04.1614164Z Container 'data-migration-trial-prd' found in 'stdncstorage3ok0r'.
-2026-06-15T10:50:04.1633912Z [3/3] Building migration plan (streaming, 20 blob(s) per page)...
-2026-06-15T10:50:04.3545476Z What if: Performing the operation "Remove File" on target "/home/devopsagent/_work/109/a/migration-plan/copy-list.txt".
-2026-06-15T10:50:04.3548978Z What if: Performing the operation "Remove File" on target "/home/devopsagent/_work/109/a/migration-plan/copy-manifest.tsv".
-2026-06-15T10:50:04.3632935Z 
-2026-06-15T10:50:04.3635556Z ##[section]MIGRATION & VALIDATION TIME -- total elapsed duration for this run
-2026-06-15T10:50:04.3636342Z Migration started:  2026-06-15 10:50:00 UTC
-2026-06-15T10:50:04.3644606Z Migration ended:    2026-06-15 10:50:04 UTC
-2026-06-15T10:50:04.3648926Z Total time elapsed: 00:00:04
-2026-06-15T10:50:04.5624115Z Error formatting a string: Index (zero based) must be greater than or equal to zero and less than the size of the argument list..
-2026-06-15T10:50:04.5655434Z At /home/devopsagent/_work/109/s/migrations/storage/storage-migration.ps1:542 char:9
-2026-06-15T10:50:04.5656199Z + $plan = Build-MigrationPlan -SourceContext $sourceCtx -SourceContaine …
-2026-06-15T10:50:04.5656513Z +         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-2026-06-15T10:50:04.6483205Z 
-2026-06-15T10:50:04.6676777Z ##[error]PowerShell exited with code '1'.
-2026-06-15T10:50:04.6685493Z [command]/home/devopsagent/.local/powershell/pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Unrestricted -Command . '/home/devopsagent/_work/_tasks/AzurePowerShell_72a1931b-effb-4d2e-8fd8-f8472a07cb62/5.274.5/RemoveAzContext.ps1'
-2026-06-15T10:50:05.8832978Z ##[command]Disconnect-AzAccount -Scope CurrentUser -ErrorAction Stop
-2026-06-15T10:50:05.9656280Z ##[command]Disconnect-AzAccount -Scope Process -ErrorAction Stop
-2026-06-15T10:50:05.9702142Z ##[command]Clear-AzContext -Scope Process -ErrorAction Stop
-2026-06-15T10:50:06.7292877Z 
-2026-06-15T10:50:06.7410086Z ##[section]Finishing: Preview Storage Migration (-WhatIf)
+2026/06/25 09:47:30 Job-Command copy https://dncstorage33cdprd.blob.core.windows.net/dnc-backups-prd https://stdncstorage3ok0r.blob.core.windows.net/data-migration-trial-prd --s2s-preserve-blob-tags --recursive 
+2026/06/25 09:47:30 Number of CPUs: 2
+2026/06/25 09:47:30 Max file buffer RAM 1.000 GB
+2026/06/25 09:47:30 Max concurrent network operations: 256 (Based on AZCOPY_CONCURRENCY_VALUE environment variable)
+2026/06/25 09:47:30 Check CPU usage when dynamically tuning concurrency: true (Based on hard-coded default. Set AZCOPY_TUNE_TO_CPU environment variable to true or false override)
+2026/06/25 09:47:30 Max concurrent transfer initiation routines: 64 (Based on hard-coded default. Set AZCOPY_CONCURRENT_FILES environment variable to override)
+2026/06/25 09:47:30 Max enumeration routines: 16 (Based on hard-coded default. Set AZCOPY_CONCURRENT_SCAN environment variable to override)
+2026/06/25 09:47:30 Parallelize getting file properties (file.Stat): false (Based on AZCOPY_PARALLEL_STAT_FILES environment variable)
+2026/06/25 09:47:30 Max open files when downloading: 523618 (auto-computed)
+2026/06/25 09:47:30 INFO: [P#0-T#0] Starting transfer: Source "https://dncstorage33cdprd.blob.core.windows.net/dnc-backups-prd/25005862/dairynet-servicebackups-46_0_10-20260622-122805.zip" Destination "https://stdncstorage3ok0r.blob.core.windows.net/data-migration-trial-prd/25005862/dairynet-servicebackups-46_0_10-20260622-122805.zip". Specified chunk size 8388608
+2026/06/25 09:47:30 INFO: [P#0-T#1] Starting transfer: Source "https://dncstorage33cdprd.blob.core.windows.net/dnc-backups-prd/a1f2ff8f-0362-4117-947b-82cfce2cb471/20260607_042403_dairybox-supervision-47_0_7-20260607-042403.zip" Destination "https://stdncstorage3ok0r.blob.core.windows.net/data-migration-trial-prd/a1f2ff8f-0362-4117-947b-82cfce2cb471/20260607_042403_dairybox-supervision-47_0_7-20260607-042403.zip". Specified chunk size 8388608
+2026/06/25 09:47:30 INFO: [P#0-T#2] Starting transfer: Source "https://dncstorage33cdprd.blob.core.windows.net/dnc-backups-prd/16db1b3e-83ca-4336-a192-7cebb5ce5537/20260616_103418_dairybox-database-47_0_4-20260616-103308-csv.zip" Destination "https://stdncstorage3ok0r.blob.core.windows.net/data-migration-trial-prd/16db1b3e-83ca-4336-a192-7cebb5ce5537/20260616_103418_dairybox-database-47_0_4-20260616-103308-csv.zip". Specified chunk size 8388608
+2026/06/25 09:47:30 INFO: [P#0-T#3] Starting transfer: Source "https://dncstorage33cdprd.blob.core.windows.net/dnc-backups-prd/844d9b86-5666-4f0a-90a1-67d7df07bdf7/dairybox-database-47_0_7-20260623-200803-csv.zip" Destination "https://stdncstorage3ok0r.blob.core.windows.net/data-migration-trial-prd/844d9b86-5666-4f0a-90a1-67d7df07bdf7/dairybox-database-47_0_7-20260623-200803-csv.zip". Specified chunk size 8388608
+2026/06/25 09:47:30 INFO: [P#0-T#4] Starting transfer: Source "https://dncstorage33cdprd.blob.core.windows.net/dnc-backups-prd/3a0bf10f-380a-4e97-afc9-49453329db1a/dairybox-database-46_0_16-20260623-155506-csv.zip" Destination "https://stdncstorage3ok0r.blob.core.windows.net/data-migration-trial-prd/3a0bf10f-380a-4e97-afc9-49453329db1a/dairybox-database-46_0_16-20260623-155506-csv.zip". Specified chunk size 8388608
+
+
+
+Job e4b108a0-84a1-fa44-541e-ad20f394aac9 has started
+Log file is located at: /home/devopsagent/_work/109/a/azcopy-logs/e4b108a0-84a1-fa44-541e-ad20f394aac9.log
+
+INFO: Trying 4 concurrent connections (initial starting point)
+
+INFO: Trying 16 concurrent connections (seeking optimum)                                           
+INFO: Trying 64 concurrent connections (seeking optimum)         
+INFO: Trying 256 concurrent connections (seeking optimum)                                         
+0.8 %, 99 Done, 0 Failed, 15299 Pending, 0 Skipped, 15398 Total, 2-sec Throughput (Mb/s): 9497.7501
+INFO: Trying 64 concurrent connections (backing off)                                                
+INFO: Trying 128 concurrent connections (seeking optimum)                                           
+INFO: Trying 64 concurrent connections (backing off)                                                
+2.1 %, 293 Done, 0 Failed, 15105 Pending, 0 Skipped, 15398 Total, 2-sec Throughput (Mb/s): 4149.7775
+INFO: Trying 76 concurrent connections (seeking optimum)                                            
+INFO: Trying 64 concurrent connections (at optimum)                                                 
+INFO:                                                                                               
+INFO: Automatic concurrency tuning completed.                                                       
+INFO:                                                                                               
+3.5 %, 531 Done, 0 Failed, 14867 Pending, 0 Skipped, 15398 Total, 2-sec Throughput (Mb/s): 3827.5803
+4.8 %, 692 Done, 0 Failed, 14706 Pending, 0 Skipped, 15398 Total, 2-sec Throughput (Mb/s): 3220.3281
