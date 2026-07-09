@@ -10,11 +10,6 @@ param(
     [Parameter(Mandatory)][string]$DestStorageAccount,
     [Parameter(Mandatory)][string]$DestContainer,
 
-    # Blobs listed per page from EACH container. Memory holds ~one page of each (so ~2x this),
-    # which is a few MB even at the max. Bigger = fewer list round-trips = faster. Azure caps a
-    # single list response at 5000, so there's no benefit above 5000.
-    [ValidateRange(1, 5000)][int]$BatchSize = 5000,
-
     # Write the full per-blob ledgers (pre-blob-status.csv / post-blob-status.csv, including
     # DestOnly rows). On by default. The merge-join produces them in the same pass, so this is
     # cheap; set to $false only if you don't want the files.
@@ -80,26 +75,6 @@ function Initialize-Directory {
     return $Path
 }
 
-# Quotes a value for CSV if it contains a comma, quote, or newline.
-function ConvertTo-CsvField {
-    [OutputType([string])]
-    param([string]$Value)
-    if (-not $Value) { return '' }
-    if ($Value -match '[",\r\n]') { return '"' + ($Value -replace '"', '""') + '"' }
-    return $Value
-}
-
-# Extracts a blob's Content-MD5 as base64, or $null if the blob has none set. Read straight
-# from the bulk listing properties -- no extra call.
-function Get-BlobMd5 {
-    [OutputType([string])]
-    param([Parameter(Mandatory)]$Blob)
-    if ($Blob.PSObject.Properties['BlobProperties'] -and $Blob.BlobProperties -and $Blob.BlobProperties.ContentHash) {
-        return [Convert]::ToBase64String($Blob.BlobProperties.ContentHash)
-    }
-    return $null
-}
-
 # Best-effort cleanup of our own scratch files left by previous runs. Matters on a
 # persistent self-hosted agent: a hard OOM kill skips the finally block, so the NEXT run
 # clears the orphans here instead of letting them accumulate on the VM forever.
@@ -156,174 +131,374 @@ function Assert-ContainerExists {
     Write-Host ("Container '{0}' found in '{1}'." -f $Container, $AccountName)
 }
 
-# Classifies a matched (same-name) source/destination pair. Status strings match the old
-# pre/post-blob-status.csv so downstream tooling doesn't change.
-function Resolve-BlobStatus {
-    [OutputType([string])]
-    param(
-        [long]$SrcLen,
-        [AllowEmptyString()][string]$SrcMd5,
-        [long]$DstLen,
-        [AllowEmptyString()][string]$DstMd5
-    )
-    if ($SrcLen -ne $DstLen)           { return 'SizeMismatch' }
-    if (-not $SrcMd5 -or -not $DstMd5) { return 'Matched (size only -- no MD5)' }
-    if ($SrcMd5 -ne $DstMd5)           { return 'Md5Mismatch' }
-    return 'Matched'
-}
-
-# Creates a lazy, paged cursor over a container's blobs (returned in sorted name order).
-function New-BlobCursor {
+# Launches 'azcopy list' over one container as a child process, streaming JSON lines to a
+# scratch file, and returns a handle so both containers can be listed IN PARALLEL. azcopy
+# enumerates blobs far faster than paged Get-AzStorageBlob, and Name/size/Content-MD5/BlobType
+# all ride along in the same listing -- no extra per-blob calls.
+function Start-ContainerListing {
     [OutputType([pscustomobject])]
     param(
-        [Parameter(Mandatory)]$Context,
+        [Parameter(Mandatory)][string]$Account,
         [Parameter(Mandatory)][string]$Container,
-        [Parameter(Mandatory)][int]$BatchSize
+        # 'source' / 'destination' -- names the scratch files and error messages.
+        [Parameter(Mandatory)][string]$Label
     )
-    [pscustomobject]@{
-        Context   = $Context
-        Container = $Container
-        BatchSize = $BatchSize
-        Page      = @()
-        Index     = 0
-        Token     = $null
-        Done      = $false
+    # The plan/preview run (-WhatIf) still needs real listings, and Start-Process would
+    # otherwise no-op under an inherited -WhatIf.
+    $WhatIfPreference = $false
+
+    $stamp   = [guid]::NewGuid().ToString('N')
+    $outFile = Join-Path ([IO.Path]::GetTempPath()) "azcopy-list-$Label-$stamp.jsonl"
+    $errFile = Join-Path ([IO.Path]::GetTempPath()) "azcopy-list-$Label-$stamp.err"
+    $url     = "https://$Account.blob.core.windows.net/$Container"
+
+    # --machine-readable = exact byte counts. JSON output so blob names containing ';' (the
+    # text format's field separator) can't corrupt the parse.
+    $process = Start-Process -FilePath 'azcopy' `
+        -ArgumentList @('list', $url, '--machine-readable', '--properties', 'ContentMD5;BlobType', '--output-type', 'json') `
+        -RedirectStandardOutput $outFile -RedirectStandardError $errFile `
+        -NoNewWindow -PassThru
+    [pscustomobject]@{ Process = $process; OutFile = $outFile; ErrFile = $errFile; Url = $url; Label = $Label }
+}
+
+# Blocks until every parallel listing process exits, printing a heartbeat with the growing
+# scratch-file sizes. Throws (with the tail of azcopy's stderr) if any listing failed.
+function Wait-ContainerListing {
+    param([Parameter(Mandatory)][pscustomobject[]]$Listing)
+    $waitStart = [datetime]::UtcNow
+    while (@($Listing | Where-Object { -not $_.Process.HasExited }).Count -gt 0) {
+        Start-Sleep -Seconds 15
+        $sizes = foreach ($l in $Listing) {
+            $bytes = if (Test-Path -LiteralPath $l.OutFile) { (Get-Item -LiteralPath $l.OutFile).Length } else { 0 }
+            '{0} {1}' -f $l.Label, (Format-FileSize $bytes)
+        }
+        Write-Host ('       listing... {0:hh\:mm\:ss} elapsed ({1})' -f ([datetime]::UtcNow - $waitStart), ($sizes -join ', '))
+    }
+    foreach ($l in $Listing) {
+        if ($l.Process.ExitCode -ne 0) {
+            $stderrTail = ''
+            try { $stderrTail = (Get-Content -LiteralPath $l.ErrFile -Tail 5 -ErrorAction Stop) -join ' | ' } catch { }
+            throw ('azcopy list of the {0} container failed with exit code {1} ({2}). {3}' -f $l.Label, $l.Process.ExitCode, $l.Url, $stderrTail)
+        }
     }
 }
 
-# Returns the next blob from a cursor as a lightweight record (Name/Length/MD5/BlobType), or
-# $null when the container is exhausted. Fetches a new page only when the current one runs out,
-# so only one page per cursor is ever held in memory.
-function Get-NextBlob {
-    param([Parameter(Mandatory)]$Cursor)
-    while ($true) {
-        if ($Cursor.Index -lt $Cursor.Page.Count) {
-            $rec = $Cursor.Page[$Cursor.Index]
-            $Cursor.Index++
-            return $rec
-        }
-        if ($Cursor.Done) { return $null }
+# ── COMPILED MERGE-JOIN CORE ──────────────────────────────────────────────────
+# The per-record cost of an interpreted PowerShell loop (~0.4 ms) turns a 900k-blob scan into
+# 10+ minutes; the same merge-join compiled runs in seconds. Statuses and CSV formats are
+# identical to the previous in-script implementation. Compiled once per process (guarded
+# below); Add-Type costs ~1s at script start.
+$script:MergeJoinSource = @'
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Text.Json;
 
-        $page = @(Get-AzStorageBlob -Container $Cursor.Container -Context $Cursor.Context `
-                    -MaxCount $Cursor.BatchSize -ContinuationToken $Cursor.Token -ErrorAction Stop)
-        if ($page.Count -eq 0) { $Cursor.Done = $true; return $null }
-
-        $last = $page[$page.Count - 1]
-        $Cursor.Token = if ($last.PSObject.Properties['ContinuationToken']) { $last.ContinuationToken } else { $null }
-        if ($null -eq $Cursor.Token) { $Cursor.Done = $true }
-
-        # Project to small records and drop the heavy blob objects before looping back.
-        $Cursor.Page = @($page | ForEach-Object {
-            [pscustomobject]@{
-                Name     = $_.Name
-                Length   = [long]$_.Length
-                MD5      = Get-BlobMd5 $_
-                BlobType = [string]$_.BlobType
-            }
-        })
-        $Cursor.Index = 0
+namespace StorageMigration
+{
+    // Counters returned to PowerShell.
+    public sealed class MergeJoinResult
+    {
+        public long SourceCount;
+        public long CopyCount;
+        public long DeferredCount;
+        public long CopyBytes;
+        public long InSyncCount;
+        public long SizeMismatchCount;
+        public long Md5MismatchCount;
+        public long DestOnlyCount;
+        public List<string> DivergedSample = new List<string>();
     }
+
+    // Streams one azcopy JSON listing file as ordered blob records. Skips azcopy's non-blob
+    // envelopes (Init/Info/ListSummary); anything unparseable throws with the offending line,
+    // so an azcopy output-format change fails the run loudly instead of silently mis-planning.
+    internal sealed class ListingReader : IDisposable
+    {
+        private readonly StreamReader reader;
+        private readonly string label;
+        private string prevName;
+        private long objectCount;
+        private bool sawLegacyRows;
+
+        public string Name;
+        public long Length;
+        public string Md5;
+        public string BlobType;
+
+        public ListingReader(string path, string label)
+        {
+            this.reader = new StreamReader(path);
+            this.label = label;
+        }
+
+        public bool MoveNext()
+        {
+            string line;
+            while ((line = reader.ReadLine()) != null)
+            {
+                if (line.Length == 0) { continue; }
+                try
+                {
+                    using (JsonDocument envelope = JsonDocument.Parse(line))
+                    {
+                        string messageType = envelope.RootElement.GetProperty("MessageType").GetString();
+                        if (messageType != "ListObject")
+                        {
+                            // Old azcopy (< 10.21) emitted blob rows as plain Info text; note
+                            // that so end-of-file can fail loudly instead of reporting 0 blobs.
+                            if (messageType == "Info" && line.Contains("Content Length")) { sawLegacyRows = true; }
+                            continue;
+                        }
+
+                        // MessageContent is a JSON document in its own right (azcopy double-
+                        // encodes it). ContentMD5/BlobType are omitted entirely when unset.
+                        using (JsonDocument body = JsonDocument.Parse(envelope.RootElement.GetProperty("MessageContent").GetString()))
+                        {
+                            string name = null; long length = 0; bool haveLength = false;
+                            string md5 = ""; string blobType = "";
+                            foreach (JsonProperty prop in body.RootElement.EnumerateObject())
+                            {
+                                switch (prop.Name)
+                                {
+                                    case "Path":
+                                        name = prop.Value.GetString();
+                                        break;
+                                    case "ContentLength":
+                                        length = prop.Value.ValueKind == JsonValueKind.Number
+                                            ? prop.Value.GetInt64()
+                                            : long.Parse(prop.Value.GetString(), CultureInfo.InvariantCulture);
+                                        haveLength = true;
+                                        break;
+                                    case "ContentMD5":
+                                        if (prop.Value.ValueKind == JsonValueKind.String) { md5 = prop.Value.GetString(); }
+                                        break;
+                                    case "BlobType":
+                                        if (prop.Value.ValueKind == JsonValueKind.String) { blobType = prop.Value.GetString(); }
+                                        break;
+                                }
+                            }
+                            if (name == null || !haveLength) { throw new InvalidDataException("ListObject row is missing Path or ContentLength"); }
+                            Name = name; Length = length; Md5 = md5; BlobType = blobType;
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    throw new InvalidDataException(string.Format(
+                        "Unrecognized azcopy list output in the {0} listing ({1}): {2}", label, ex.Message, line));
+                }
+
+                // The blob service returns names in ascending ordinal order and the merge-join
+                // relies on it; a violation would silently mis-plan, so check every record.
+                if (prevName != null && string.CompareOrdinal(prevName, Name) > 0)
+                {
+                    throw new InvalidDataException(string.Format(
+                        "The {0} listing is out of order ('{1}' arrived after '{2}'); cannot merge-join.", label, Name, prevName));
+                }
+                prevName = Name;
+                objectCount++;
+                return true;
+            }
+            if (objectCount == 0 && sawLegacyRows)
+            {
+                throw new InvalidDataException(string.Format(
+                    "The {0} listing contains azcopy's legacy text rows instead of structured ListObject rows. Upgrade azcopy on the agent (>= 10.21).", label));
+            }
+            return false;
+        }
+
+        public void Dispose() { reader.Dispose(); }
+    }
+
+    public static class ContainerMergeJoin
+    {
+        // Merge-joins two sorted listing files, writing the plan / copy list / ledger CSVs
+        // (pass null or empty for any output to skip it).
+        public static MergeJoinResult Run(
+            string sourceListingPath, string destListingPath,
+            string planCsvPath, string copyListPath, string ledgerCsvPath,
+            long maxFilesPerRun, string progressLabel)
+        {
+            MergeJoinResult r = new MergeJoinResult();
+            long scanned = 0;
+            const long reportInterval = 500000;
+            long nextReport = reportInterval;
+
+            ListingReader src = new ListingReader(sourceListingPath, "source");
+            ListingReader dst = new ListingReader(destListingPath, "destination");
+            StreamWriter plan = string.IsNullOrEmpty(planCsvPath) ? null : new StreamWriter(planCsvPath, false);
+            StreamWriter copyList = string.IsNullOrEmpty(copyListPath) ? null : new StreamWriter(copyListPath, false);
+            StreamWriter ledger = string.IsNullOrEmpty(ledgerCsvPath) ? null : new StreamWriter(ledgerCsvPath, false);
+            try
+            {
+                if (plan != null) { plan.WriteLine("BlobName,Action,BlobType,SizeBytes,Reason"); }
+                if (ledger != null) { ledger.WriteLine("Name,BlobType,SourceSize,DestSize,SourceMD5,DestMD5,Status"); }
+
+                bool haveSrc = src.MoveNext();
+                bool haveDst = dst.MoveNext();
+                while (haveSrc || haveDst)
+                {
+                    int cmp = !haveDst ? -1 : (!haveSrc ? 1 : string.CompareOrdinal(src.Name, dst.Name));
+                    if (cmp < 0)
+                    {
+                        // Source only -> missing from destination.
+                        r.SourceCount++;
+                        if (maxFilesPerRun <= 0 || r.CopyCount < maxFilesPerRun)
+                        {
+                            // Within this run's budget -> copy it now.
+                            r.CopyCount++;
+                            r.CopyBytes += src.Length;
+                            if (plan != null) { plan.WriteLine(Csv(src.Name) + ",Copy," + src.BlobType + "," + src.Length + ",Missing from destination"); }
+                            if (copyList != null) { copyList.WriteLine(src.Name); }
+                        }
+                        else
+                        {
+                            // Over this run's cap -> leave it for a later run.
+                            r.DeferredCount++;
+                        }
+                        if (ledger != null) { ledger.WriteLine(Csv(src.Name) + "," + src.BlobType + "," + src.Length + ",," + src.Md5 + ",,Missing"); }
+                        scanned++;
+                        haveSrc = src.MoveNext();
+                    }
+                    else if (cmp > 0)
+                    {
+                        // Destination only -> preserved, not in source.
+                        r.DestOnlyCount++;
+                        if (ledger != null) { ledger.WriteLine(Csv(dst.Name) + "," + dst.BlobType + ",," + dst.Length + ",," + dst.Md5 + ",DestOnly"); }
+                        scanned++;
+                        haveDst = dst.MoveNext();
+                    }
+                    else
+                    {
+                        // Same name in both -> compare size, then MD5 when both sides have one.
+                        r.SourceCount++;
+                        string status;
+                        if (src.Length != dst.Length)
+                        {
+                            status = "SizeMismatch";
+                            r.SizeMismatchCount++;
+                            if (plan != null) { plan.WriteLine(Csv(src.Name) + ",Skip-Diverged," + src.BlobType + "," + src.Length + ",Size mismatch"); }
+                            if (r.DivergedSample.Count < 50) { r.DivergedSample.Add(src.Name + "  (source=" + FormatSize(src.Length) + ", dest=" + FormatSize(dst.Length) + ")"); }
+                        }
+                        else if (string.IsNullOrEmpty(src.Md5) || string.IsNullOrEmpty(dst.Md5))
+                        {
+                            status = "Matched (size only -- no MD5)";
+                            r.InSyncCount++;
+                        }
+                        else if (src.Md5 != dst.Md5)
+                        {
+                            status = "Md5Mismatch";
+                            r.Md5MismatchCount++;
+                            if (plan != null) { plan.WriteLine(Csv(src.Name) + ",Skip-Diverged," + src.BlobType + "," + src.Length + ",MD5 mismatch"); }
+                            if (r.DivergedSample.Count < 50) { r.DivergedSample.Add(src.Name + "  (source-md5=" + src.Md5 + ", dest-md5=" + dst.Md5 + ")"); }
+                        }
+                        else
+                        {
+                            status = "Matched";
+                            r.InSyncCount++;
+                        }
+                        if (ledger != null) { ledger.WriteLine(Csv(src.Name) + "," + src.BlobType + "," + src.Length + "," + dst.Length + "," + src.Md5 + "," + dst.Md5 + "," + status); }
+                        scanned += 2;
+                        haveSrc = src.MoveNext();
+                        haveDst = dst.MoveNext();
+                    }
+
+                    if (scanned >= nextReport)
+                    {
+                        Console.WriteLine("       " + progressLabel + " " + r.SourceCount + " source / " + r.DestOnlyCount +
+                            " dest-only blob(s)... (copy " + r.CopyCount + ", in-sync " + r.InSyncCount +
+                            ", diverged " + (r.SizeMismatchCount + r.Md5MismatchCount) + ")");
+                        nextReport += reportInterval;
+                    }
+                }
+            }
+            finally
+            {
+                src.Dispose();
+                dst.Dispose();
+                if (plan != null) { plan.Dispose(); }
+                if (copyList != null) { copyList.Dispose(); }
+                if (ledger != null) { ledger.Dispose(); }
+            }
+            return r;
+        }
+
+        private static readonly char[] CsvSpecials = { ',', '"', '\r', '\n' };
+
+        // Quotes a CSV field when it contains a comma, quote, or newline.
+        private static string Csv(string value)
+        {
+            if (string.IsNullOrEmpty(value)) { return ""; }
+            if (value.IndexOfAny(CsvSpecials) >= 0) { return "\"" + value.Replace("\"", "\"\"") + "\""; }
+            return value;
+        }
+
+        // Matches the PowerShell Format-FileSize output (N2 GB / MB / KB, plain bytes).
+        private static string FormatSize(long bytes)
+        {
+            if (bytes >= 1073741824L) { return ((double)bytes / 1073741824).ToString("N2") + " GB"; }
+            if (bytes >= 1048576L) { return ((double)bytes / 1048576).ToString("N2") + " MB"; }
+            if (bytes >= 1024L) { return ((double)bytes / 1024).ToString("N2") + " KB"; }
+            return bytes + " B";
+        }
+    }
+}
+'@
+if (-not ('StorageMigration.ContainerMergeJoin' -as [type])) {
+    Add-Type -TypeDefinition $script:MergeJoinSource -ReferencedAssemblies @(
+        'System.Runtime', 'System.Collections', 'System.Console', 'System.Text.Json', 'System.Memory', 'System.IO.FileSystem'
+    )
 }
 
 function Invoke-ContainerMergeJoin {
     [OutputType([pscustomobject])]
     param(
-        [Parameter(Mandatory)]$SourceContext,
+        [Parameter(Mandatory)][string]$SourceAccount,
         [Parameter(Mandatory)][string]$SourceContainer,
-        [Parameter(Mandatory)]$DestContext,
+        [Parameter(Mandatory)][string]$DestAccount,
         [Parameter(Mandatory)][string]$DestContainer,
-        [Parameter(Mandatory)][int]$BatchSize,
-        [System.IO.StreamWriter]$PlanWriter,      # migration-plan.csv rows (Copy / Skip-Diverged)
-        [System.IO.StreamWriter]$CopyListWriter,  # azcopy --list-of-files (names only)
-        [System.IO.StreamWriter]$LedgerWriter,    # full per-blob status ledger
-        [long]$MaxFilesPerRun = 0,                # cap on blobs added to the copy list (0 = no cap)
+        [string]$PlanCsvPath,      # migration-plan.csv (Copy / Skip-Diverged rows); '' = skip
+        [string]$CopyListPath,     # azcopy --list-of-files (names only); '' = skip
+        [string]$LedgerCsvPath,    # full per-blob status ledger; '' = skip
+        [long]$MaxFilesPerRun = 0, # cap on blobs added to the copy list (0 = no cap)
         [string]$ProgressLabel = 'scanned'
     )
-    $sourceCount = 0L; $copyCount = 0L; $deferredCount = 0L; [long]$copyBytes = 0
-    $sizeMismatch = 0L; $md5Mismatch = 0L; $matched = 0L; $destOnly = 0L
-    $divergedSample = [System.Collections.Generic.List[string]]::new()
-    $scanned = 0L; $reportInterval = 5000L; $nextReport = $reportInterval
-
-    $srcCur = New-BlobCursor -Context $SourceContext -Container $SourceContainer -BatchSize $BatchSize
-    $dstCur = New-BlobCursor -Context $DestContext   -Container $DestContainer   -BatchSize $BatchSize
-    $src = Get-NextBlob $srcCur
-    $dst = Get-NextBlob $dstCur
-
-    while ($null -ne $src -or $null -ne $dst) {
-        $cmp = if     ($null -eq $dst) { -1 }
-               elseif ($null -eq $src) {  1 }
-               else   { [string]::CompareOrdinal($src.Name, $dst.Name) }
-
-        if ($cmp -lt 0) {
-            # Source only -> missing from destination.
-            $sourceCount++
-            if ($MaxFilesPerRun -le 0 -or $copyCount -lt $MaxFilesPerRun) {
-                # Within this run's budget -> copy it now.
-                $copyCount++; $copyBytes += $src.Length
-                if ($PlanWriter)     { $PlanWriter.WriteLine(('{0},Copy,{1},{2},Missing from destination' -f (ConvertTo-CsvField $src.Name), $src.BlobType, $src.Length)) }
-                if ($CopyListWriter) { $CopyListWriter.WriteLine($src.Name) }
-            }
-            else {
-                # Over this run's cap -> leave it for a later run.
-                $deferredCount++
-            }
-            if ($LedgerWriter) { $LedgerWriter.WriteLine(('{0},{1},{2},,{3},,Missing' -f (ConvertTo-CsvField $src.Name), $src.BlobType, $src.Length, $src.MD5)) }
-            $scanned++
-            $src = Get-NextBlob $srcCur
+    # Enumerate both containers IN PARALLEL with azcopy, then merge-join the listing files in
+    # the compiled core. The two listings overlap in time instead of alternating page-by-page.
+    Write-Host '       listing source and destination containers in parallel (azcopy list)...'
+    $listings = @(
+        (Start-ContainerListing -Account $SourceAccount -Container $SourceContainer -Label 'source'),
+        (Start-ContainerListing -Account $DestAccount   -Container $DestContainer   -Label 'destination')
+    )
+    try {
+        Wait-ContainerListing -Listing $listings
+        Write-Host '       merge-joining the listings...'
+        $r = [StorageMigration.ContainerMergeJoin]::Run(
+            $listings[0].OutFile, $listings[1].OutFile,
+            $PlanCsvPath, $CopyListPath, $LedgerCsvPath, $MaxFilesPerRun, $ProgressLabel)
+    }
+    finally {
+        # Reap the listing processes and scratch files even on failure; a hard kill that skips
+        # this is covered by Clear-StaleScratch on the next run.
+        foreach ($l in $listings) {
+            if (-not $l.Process.HasExited) { try { $l.Process.Kill() } catch { } }
         }
-        elseif ($cmp -gt 0) {
-            # Destination only -> preserved, not in source.
-            $destOnly++
-            if ($LedgerWriter) { $LedgerWriter.WriteLine(('{0},{1},,{2},,{3},DestOnly' -f (ConvertTo-CsvField $dst.Name), $dst.BlobType, $dst.Length, $dst.MD5)) }
-            $scanned++
-            $dst = Get-NextBlob $dstCur
-        }
-        else {
-            # Same name in both -> compare size and MD5.
-            $sourceCount++
-            $status = Resolve-BlobStatus -SrcLen $src.Length -SrcMd5 $src.MD5 -DstLen $dst.Length -DstMd5 $dst.MD5
-            switch ($status) {
-                'SizeMismatch' {
-                    $sizeMismatch++
-                    if ($PlanWriter) { $PlanWriter.WriteLine(('{0},Skip-Diverged,{1},{2},Size mismatch' -f (ConvertTo-CsvField $src.Name), $src.BlobType, $src.Length)) }
-                    if ($divergedSample.Count -lt 50) { $divergedSample.Add(("{0}  (source={1}, dest={2})" -f $src.Name, (Format-FileSize $src.Length), (Format-FileSize $dst.Length))) }
-                }
-                'Md5Mismatch' {
-                    $md5Mismatch++
-                    if ($PlanWriter) { $PlanWriter.WriteLine(('{0},Skip-Diverged,{1},{2},MD5 mismatch' -f (ConvertTo-CsvField $src.Name), $src.BlobType, $src.Length)) }
-                    if ($divergedSample.Count -lt 50) { $divergedSample.Add(("{0}  (source-md5={1}, dest-md5={2})" -f $src.Name, $src.MD5, $dst.MD5)) }
-                }
-                default {
-                    # 'Matched' or 'Matched (size only -- no MD5)'
-                    $matched++
-                }
-            }
-            if ($LedgerWriter) {
-                $LedgerWriter.WriteLine(('{0},{1},{2},{3},{4},{5},{6}' -f (ConvertTo-CsvField $src.Name), $src.BlobType, $src.Length, $dst.Length, $src.MD5, $dst.MD5, $status))
-            }
-            $scanned += 2
-            $src = Get-NextBlob $srcCur
-            $dst = Get-NextBlob $dstCur
-        }
-
-        if ($scanned -ge $nextReport) {
-            Write-Host ('       {0} {1} source / {2} dest-only blob(s)... (copy {3}, in-sync {4}, diverged {5})' -f `
-                $ProgressLabel, $sourceCount, $destOnly, $copyCount, $matched, ($sizeMismatch + $md5Mismatch))
-            $nextReport += $reportInterval
-        }
+        Remove-Item -LiteralPath (@($listings.OutFile) + @($listings.ErrFile)) -Force -ErrorAction SilentlyContinue -WhatIf:$false
     }
 
     [pscustomobject]@{
-        SourceCount       = $sourceCount
-        CopyCount         = $copyCount
-        DeferredCount     = $deferredCount
-        CopyBytes         = $copyBytes
-        InSyncCount       = $matched
-        SizeMismatchCount = $sizeMismatch
-        Md5MismatchCount  = $md5Mismatch
-        DivergedCount     = ($sizeMismatch + $md5Mismatch)
-        DestOnlyCount     = $destOnly
-        DivergedSample    = $divergedSample
+        SourceCount       = $r.SourceCount
+        CopyCount         = $r.CopyCount
+        DeferredCount     = $r.DeferredCount
+        CopyBytes         = $r.CopyBytes
+        InSyncCount       = $r.InSyncCount
+        SizeMismatchCount = $r.SizeMismatchCount
+        Md5MismatchCount  = $r.Md5MismatchCount
+        DivergedCount     = ($r.SizeMismatchCount + $r.Md5MismatchCount)
+        DestOnlyCount     = $r.DestOnlyCount
+        DivergedSample    = $r.DivergedSample
     }
 }
 
@@ -332,11 +507,10 @@ function Invoke-ContainerMergeJoin {
 function Build-MigrationPlan {
     [OutputType([pscustomobject])]
     param(
-        [Parameter(Mandatory)]$SourceContext,
+        [Parameter(Mandatory)][string]$SourceAccount,
         [Parameter(Mandatory)][string]$SourceContainer,
-        [Parameter(Mandatory)]$DestContext,
+        [Parameter(Mandatory)][string]$DestAccount,
         [Parameter(Mandatory)][string]$DestContainer,
-        [Parameter(Mandatory)][int]$BatchSize,
         [Parameter(Mandatory)][string]$PlanDirectory,
         # When set, also write the full per-blob ledger (every blob + DestOnly rows) here.
         [string]$StatusCsvPath,
@@ -346,24 +520,10 @@ function Build-MigrationPlan {
     $planCsvPath  = Join-Path $PlanDirectory 'migration-plan.csv'
     $copyListPath = Join-Path $PlanDirectory 'copy-list.txt'        # names only, for azcopy --list-of-files
 
-    $csv      = [System.IO.StreamWriter]::new($planCsvPath, $false)
-    $copyList = [System.IO.StreamWriter]::new($copyListPath, $false)
-    $ledger   = if ($StatusCsvPath) { [System.IO.StreamWriter]::new($StatusCsvPath, $false) } else { $null }
-
-    try {
-        $csv.WriteLine('BlobName,Action,BlobType,SizeBytes,Reason')
-        if ($ledger) { $ledger.WriteLine('Name,BlobType,SourceSize,DestSize,SourceMD5,DestMD5,Status') }
-
-        $r = Invoke-ContainerMergeJoin -SourceContext $SourceContext -SourceContainer $SourceContainer `
-                                       -DestContext $DestContext -DestContainer $DestContainer `
-                                       -BatchSize $BatchSize `
-                                       -PlanWriter $csv -CopyListWriter $copyList -LedgerWriter $ledger `
-                                       -MaxFilesPerRun $MaxFilesPerRun -ProgressLabel 'scanned'
-    }
-    finally {
-        $csv.Dispose(); $copyList.Dispose()
-        if ($ledger) { $ledger.Dispose() }
-    }
+    $r = Invoke-ContainerMergeJoin -SourceAccount $SourceAccount -SourceContainer $SourceContainer `
+                                   -DestAccount $DestAccount -DestContainer $DestContainer `
+                                   -PlanCsvPath $planCsvPath -CopyListPath $copyListPath -LedgerCsvPath $StatusCsvPath `
+                                   -MaxFilesPerRun $MaxFilesPerRun -ProgressLabel 'scanned'
 
     [pscustomobject]@{
         SourceCount    = $r.SourceCount
@@ -385,24 +545,15 @@ function Build-MigrationPlan {
 function Get-PostMigrationStatus {
     [OutputType([pscustomobject])]
     param(
-        [Parameter(Mandatory)]$SourceContext,
+        [Parameter(Mandatory)][string]$SourceAccount,
         [Parameter(Mandatory)][string]$SourceContainer,
-        [Parameter(Mandatory)]$DestContext,
+        [Parameter(Mandatory)][string]$DestAccount,
         [Parameter(Mandatory)][string]$DestContainer,
-        [Parameter(Mandatory)][int]$BatchSize,
         [string]$StatusCsvPath
     )
-    $ledger = if ($StatusCsvPath) { [System.IO.StreamWriter]::new($StatusCsvPath, $false) } else { $null }
-    try {
-        if ($ledger) { $ledger.WriteLine('Name,BlobType,SourceSize,DestSize,SourceMD5,DestMD5,Status') }
-        $r = Invoke-ContainerMergeJoin -SourceContext $SourceContext -SourceContainer $SourceContainer `
-                                       -DestContext $DestContext -DestContainer $DestContainer `
-                                       -BatchSize $BatchSize -LedgerWriter $ledger -ProgressLabel 'verified'
-    }
-    finally {
-        if ($ledger) { $ledger.Dispose() }
-    }
-    return $r
+    return Invoke-ContainerMergeJoin -SourceAccount $SourceAccount -SourceContainer $SourceContainer `
+                                     -DestAccount $DestAccount -DestContainer $DestContainer `
+                                     -LedgerCsvPath $StatusCsvPath -ProgressLabel 'verified'
 }
 
 # Runs a single azcopy job over the whole copy list. azcopy streams the list file and keeps
@@ -476,7 +627,6 @@ try {
 
 Write-Log 'MIGRATION CONFIGURATION -- source and destination details for this run'
 Write-Host ('Start time:        {0:yyyy-MM-dd HH:mm:ss} UTC' -f $migrationStart)
-Write-Host ('Batch size:        {0} blob(s) per page' -f $BatchSize)
 if ($MaxFilesPerRun -gt 0) {
     Write-Host ('Max files/run:     {0} (chunked -- re-run the pipeline until nothing remains)' -f $MaxFilesPerRun)
 }
@@ -538,11 +688,11 @@ if ($CopyEntireContainer) {
 }
 
 # ── PLAN ── merge-join the two containers and write the plan to disk ─────────────
-$step++; Write-Host "[$step/$totalSteps] Building migration plan (merge-join, $BatchSize blob(s) per page)..."
+$step++; Write-Host "[$step/$totalSteps] Building migration plan (parallel azcopy listings + merge-join)..."
 $preStatusCsv = if ($BlobStatusReport) { Join-Path $planDir 'pre-blob-status.csv' } else { '' }
-$plan = Build-MigrationPlan -SourceContext $sourceCtx -SourceContainer $SourceContainer `
-                            -DestContext $destCtx -DestContainer $DestContainer `
-                            -BatchSize $BatchSize -PlanDirectory $planDir `
+$plan = Build-MigrationPlan -SourceAccount $SourceStorageAccount -SourceContainer $SourceContainer `
+                            -DestAccount $DestStorageAccount -DestContainer $DestContainer `
+                            -PlanDirectory $planDir `
                             -StatusCsvPath $preStatusCsv -MaxFilesPerRun $MaxFilesPerRun
 
 Write-Log 'PRE-MIGRATION PLAN -- what this run will do (source vs destination)'
@@ -608,9 +758,9 @@ $post = $null
 if ($plan.CopyCount -gt 0 -and -not $azCopyError) {
     $postStatusCsv = if ($BlobStatusReport) { Join-Path $logDir 'post-blob-status.csv' } else { '' }
     Write-Log ("VALIDATION -- re-comparing '{0}' to '{1}' after copy (merge-join)" -f $SourceContainer, $DestContainer)
-    $post = Get-PostMigrationStatus -SourceContext $sourceCtx -SourceContainer $SourceContainer `
-                                    -DestContext $destCtx -DestContainer $DestContainer `
-                                    -BatchSize $BatchSize -StatusCsvPath $postStatusCsv
+    $post = Get-PostMigrationStatus -SourceAccount $SourceStorageAccount -SourceContainer $SourceContainer `
+                                    -DestAccount $DestStorageAccount -DestContainer $DestContainer `
+                                    -StatusCsvPath $postStatusCsv
     if ($BlobStatusReport) {
         Write-Host ('  Post-migration ledger:   {0}' -f (Split-Path $postStatusCsv -Leaf))
         Write-Host ('  Destination-only blobs:  {0}' -f $post.DestOnlyCount)
