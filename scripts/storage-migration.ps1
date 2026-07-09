@@ -464,7 +464,7 @@ $env:AZCOPY_JOB_PLAN_LOCATION = $logDir
 # Open more parallel transfers than azcopy's core-count default (~32 on a 2-vCPU agent).
 # The copy is Azure-to-Azure (S2S), so the account bandwidth, not the agent, is the real
 # limit -- raising this uses bandwidth that the cautious default leaves idle.
-$env:AZCOPY_CONCURRENCY_VALUE = '256'
+$env:AZCOPY_CONCURRENCY_VALUE = 'AUTO'
 
 if (-not (Get-Command azcopy -ErrorAction SilentlyContinue)) {
     throw 'azcopy executable not found in PATH. Install it on the agent (e.g. via the AzureCLI@2 task or a dedicated AzCopy install step) before running this script.'
