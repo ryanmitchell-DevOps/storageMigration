@@ -211,14 +211,24 @@ namespace StorageMigration
         public List<string> DivergedSample = new List<string>();
     }
 
-    // Streams one azcopy JSON listing file as ordered blob records. Skips azcopy's non-blob
-    // envelopes (Init/Info/ListSummary); anything unparseable throws with the offending line,
-    // so an azcopy output-format change fails the run loudly instead of silently mis-planning.
+    // One blob row from a listing.
+    internal sealed class BlobRecord
+    {
+        public string Name;
+        public long Length;
+        public string Md5;
+        public string BlobType;
+    }
+
+    // Streams one azcopy JSON listing file as blob records, in whatever order azcopy emitted
+    // them (NOT necessarily sorted -- azcopy parallelizes enumeration on large containers).
+    // Skips azcopy's non-blob envelopes (Init/Info/ListSummary); anything unparseable throws
+    // with the offending line, so an azcopy output-format change fails the run loudly instead
+    // of silently mis-planning.
     internal sealed class ListingReader : IDisposable
     {
         private readonly StreamReader reader;
         private readonly string label;
-        private string prevName;
         private long objectCount;
         private bool sawLegacyRows;
 
@@ -290,14 +300,6 @@ namespace StorageMigration
                         "Unrecognized azcopy list output in the {0} listing ({1}): {2}", label, ex.Message, line));
                 }
 
-                // The blob service returns names in ascending ordinal order and the merge-join
-                // relies on it; a violation would silently mis-plan, so check every record.
-                if (prevName != null && string.CompareOrdinal(prevName, Name) > 0)
-                {
-                    throw new InvalidDataException(string.Format(
-                        "The {0} listing is out of order ('{1}' arrived after '{2}'); cannot merge-join.", label, Name, prevName));
-                }
-                prevName = Name;
                 objectCount++;
                 return true;
             }
@@ -310,6 +312,140 @@ namespace StorageMigration
         }
 
         public void Dispose() { reader.Dispose(); }
+    }
+
+    // Yields a listing's records in ascending ordinal name order regardless of the order
+    // azcopy emitted them, with duplicate rows dropped (azcopy's parallel enumeration has
+    // produced both out-of-order and repeated rows on large containers). Records are sorted
+    // in chunks that spill to disk, then k-way merged, so memory stays bounded (~one chunk)
+    // no matter how many blobs are listed.
+    internal sealed class SortedListingCursor : IDisposable
+    {
+        private const int ChunkSize = 250000;
+        private readonly string label;
+        private readonly List<string> chunkFiles = new List<string>();
+        private readonly List<BinaryReader> chunkReaders = new List<BinaryReader>();
+        private BlobRecord[] heads;          // current front record of each chunk (null = drained)
+        private List<BlobRecord> single;     // in-memory path when everything fits in one chunk
+        private int singleIndex;
+        private string prevName;
+
+        public string Name;
+        public long Length;
+        public string Md5;
+        public string BlobType;
+
+        public SortedListingCursor(string listingPath, string label)
+        {
+            this.label = label;
+            List<BlobRecord> chunk = new List<BlobRecord>();
+            try
+            {
+                using (ListingReader lr = new ListingReader(listingPath, label))
+                {
+                    while (lr.MoveNext())
+                    {
+                        chunk.Add(new BlobRecord { Name = lr.Name, Length = lr.Length, Md5 = lr.Md5, BlobType = lr.BlobType });
+                        if (chunk.Count >= ChunkSize) { FlushChunk(chunk); }
+                    }
+                }
+                if (chunkFiles.Count == 0)
+                {
+                    chunk.Sort(CompareByName);
+                    single = chunk;
+                }
+                else
+                {
+                    if (chunk.Count > 0) { FlushChunk(chunk); }
+                    heads = new BlobRecord[chunkFiles.Count];
+                    for (int i = 0; i < chunkFiles.Count; i++)
+                    {
+                        chunkReaders.Add(new BinaryReader(new FileStream(chunkFiles[i], FileMode.Open, FileAccess.Read, FileShare.None, 1 << 16)));
+                        heads[i] = ReadRecord(chunkReaders[i]);
+                    }
+                }
+            }
+            catch
+            {
+                Dispose();
+                throw;
+            }
+        }
+
+        public bool MoveNext()
+        {
+            while (true)
+            {
+                BlobRecord rec = NextRaw();
+                if (rec == null) { return false; }
+                // azcopy has been seen to repeat rows; identical names are the same blob.
+                if (prevName != null && string.CompareOrdinal(prevName, rec.Name) == 0) { continue; }
+                prevName = rec.Name;
+                Name = rec.Name; Length = rec.Length; Md5 = rec.Md5; BlobType = rec.BlobType;
+                return true;
+            }
+        }
+
+        private BlobRecord NextRaw()
+        {
+            if (single != null)
+            {
+                return singleIndex < single.Count ? single[singleIndex++] : null;
+            }
+            int min = -1;
+            for (int i = 0; i < heads.Length; i++)
+            {
+                if (heads[i] == null) { continue; }
+                if (min < 0 || string.CompareOrdinal(heads[i].Name, heads[min].Name) < 0) { min = i; }
+            }
+            if (min < 0) { return null; }
+            BlobRecord rec = heads[min];
+            heads[min] = ReadRecord(chunkReaders[min]);
+            return rec;
+        }
+
+        private void FlushChunk(List<BlobRecord> chunk)
+        {
+            chunk.Sort(CompareByName);
+            // Named azcopy-list-* so the script's stale-scratch sweep reaps orphans.
+            string path = Path.Combine(Path.GetTempPath(),
+                "azcopy-list-sort-" + label + "-" + Guid.NewGuid().ToString("N") + ".bin");
+            using (BinaryWriter w = new BinaryWriter(new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None, 1 << 16)))
+            {
+                foreach (BlobRecord rec in chunk)
+                {
+                    w.Write(rec.Name);
+                    w.Write(rec.Length);
+                    w.Write(rec.Md5);
+                    w.Write(rec.BlobType);
+                }
+            }
+            chunkFiles.Add(path);
+            chunk.Clear();
+        }
+
+        private static BlobRecord ReadRecord(BinaryReader r)
+        {
+            if (r.BaseStream.Position >= r.BaseStream.Length) { return null; }
+            return new BlobRecord
+            {
+                Name = r.ReadString(),
+                Length = r.ReadInt64(),
+                Md5 = r.ReadString(),
+                BlobType = r.ReadString()
+            };
+        }
+
+        private static int CompareByName(BlobRecord a, BlobRecord b)
+        {
+            return string.CompareOrdinal(a.Name, b.Name);
+        }
+
+        public void Dispose()
+        {
+            foreach (BinaryReader r in chunkReaders) { try { r.Dispose(); } catch { } }
+            foreach (string f in chunkFiles) { try { File.Delete(f); } catch { } }
+        }
     }
 
     public static class ContainerMergeJoin
@@ -326,13 +462,19 @@ namespace StorageMigration
             const long reportInterval = 500000;
             long nextReport = reportInterval;
 
-            ListingReader src = new ListingReader(sourceListingPath, "source");
-            ListingReader dst = new ListingReader(destListingPath, "destination");
-            StreamWriter plan = string.IsNullOrEmpty(planCsvPath) ? null : new StreamWriter(planCsvPath, false);
-            StreamWriter copyList = string.IsNullOrEmpty(copyListPath) ? null : new StreamWriter(copyListPath, false);
-            StreamWriter ledger = string.IsNullOrEmpty(ledgerCsvPath) ? null : new StreamWriter(ledgerCsvPath, false);
+            SortedListingCursor src = null;
+            SortedListingCursor dst = null;
+            StreamWriter plan = null;
+            StreamWriter copyList = null;
+            StreamWriter ledger = null;
             try
             {
+                src = new SortedListingCursor(sourceListingPath, "source");
+                dst = new SortedListingCursor(destListingPath, "destination");
+                plan = string.IsNullOrEmpty(planCsvPath) ? null : new StreamWriter(planCsvPath, false);
+                copyList = string.IsNullOrEmpty(copyListPath) ? null : new StreamWriter(copyListPath, false);
+                ledger = string.IsNullOrEmpty(ledgerCsvPath) ? null : new StreamWriter(ledgerCsvPath, false);
+
                 if (plan != null) { plan.WriteLine("BlobName,Action,BlobType,SizeBytes,Reason"); }
                 if (ledger != null) { ledger.WriteLine("Name,BlobType,SourceSize,DestSize,SourceMD5,DestMD5,Status"); }
 
@@ -416,8 +558,8 @@ namespace StorageMigration
             }
             finally
             {
-                src.Dispose();
-                dst.Dispose();
+                if (src != null) { src.Dispose(); }
+                if (dst != null) { dst.Dispose(); }
                 if (plan != null) { plan.Dispose(); }
                 if (copyList != null) { copyList.Dispose(); }
                 if (ledger != null) { ledger.Dispose(); }
