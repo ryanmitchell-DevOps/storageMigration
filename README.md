@@ -1,200 +1,217 @@
-server.max-http-request-header-size=100KB
-spring.main.banner-mode=off
-server.compression.enabled=true
-server.port=10080
-mobile-proxy.whitelist-file=mobile-proxy-whitelist.restricted.properties
-spring.config.import=actuator.properties,${mobile-proxy.whitelist-file}
-springdoc.api-docs.path=/api-docs
-springdoc.writer-with-order-by-keys=true
-springdoc.writer-with-default-pretty-printer=true
-springdoc.override-with-generic-response=false
-springdoc.remove-broken-reference-definitions=false
+package com.gea.ft.service.farmsiteconnector.config;
 
-# DB
-spring.liquibase.change-log=classpath:db/changelog/changelog-master.xml
-spring.jpa.hibernate.naming.physical-strategy=org.hibernate.boot.model.naming.CamelCaseToUnderscoresNamingStrategy
-spring.jpa.hibernate.naming.implicit-strategy=org.springframework.boot.orm.jpa.hibernate.SpringImplicitNamingStrategy
-# Connection pool
-spring.datasource.hikari.minimum-idle=2
-spring.datasource.hikari.maximum-pool-size=10
+import com.azure.core.credential.AzureNamedKeyCredential;
+import com.azure.identity.DefaultAzureCredential;
+import com.azure.identity.DefaultAzureCredentialBuilder;
+import com.azure.storage.blob.BlobServiceClient;
+import com.azure.storage.blob.BlobServiceClientBuilder;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Primary;
+import org.springframework.context.annotation.Profile;
 
-# Service config
-# Will try to automatically connect to the IoTHub on startup
-app.auto-connect=true
-# Max time before a message is considered to be permanently failed
-app.max-retry-age=24h
-# Time between tries to resend failed messages
-app.retry-failed.fixed-rate-minutes=1
-# Initial delay on startup, before first try to resend failed messages
-app.retry-failed.initial-delay-minutes=1
-app.max-pending-messages=10000
-app.max-failed-messages-per-try=${rate-limit.message.max-capacity}
-app.failed-messages-page-size=100
-app.default-priority=999
-# Basic Auth (PW = xRH6QUdh0J-Bs640U3Za)
-app.basic-auth.enabled=false
-app.basic-auth.username=messagingUser
-app.basic-auth.password={bcrypt}$2a$10$wwGCTxq66b6lUsuYpT31fOKJiEYg9SLhEYValHzhFe6tfY/pJkWzi
-# DairyNet communication config
-dairynet.host=http://backend:8080
-dairynet.basic-auth.username=
-dairynet.basic-auth.password=
-dairynet.backup.username=farmview
-dairynet.backup.password=farmview
-dairynet.version-endpoint=/version
+@Configuration
+public class BlobServiceClientConfiguration {
 
-dairynet.velos.endpoint=/farmview/velosrouting?action=versioninformation
-dairynet.velos.username=farmview
-dairynet.velos.password=farmview
+    @Profile("!local & !openapi & !test")
+    @Bean
+    public AzureCredential defaultCredential() {
+        return new AzureCredential(new DefaultAzureCredentialBuilder().build(), null);
+    }
 
-# Cloud Connector Connection Check Configuration
-cloud-connection-check.username=farmview
-cloud-connection-check.password=farmview
-# Cloud Connector Connection Check Configuration Defaults
-#cloud-connection-check.type-id-connection-lost=12002
-#cloud-connection-check.type-id-connection-restored=12003
-#cloud-connection-check.category=CLOUD_CONNECTOR
-#cloud-connection-check.sender-domain=Cloud Connector
-#cloud-connection-check.sender-node=Cloud Connector
-#cloud-connection-check.sender-type=technical
-#cloud-connection-check.check-interval=PT5M
+    @Bean(name = "publicBlobClient")
+    public BlobServiceClient publicBlobServiceClient(AzureCredential credential,
+                                                     @Value("${public.assets.storage.account.endpoint}") String publicStorageAccountEndpoint) {
+        BlobServiceClientBuilder builder = new BlobServiceClientBuilder().endpoint(publicStorageAccountEndpoint);
+        if (credential.defaultCredential != null) {
+            builder = builder.credential(credential.defaultCredential);
+        } else {
+            builder = builder.credential(credential.keyCredential);
+        }
+        return builder.buildClient();
+    }
 
-dairynet.not-reachable.notification-id=12004
-dairynet.not-reachable.severity=3
-# Backup Scan Config
-backup.enabled=false
-backup.directory=./backups
-backup.scan-delay=10000
-# Ant-Style file filter for the name of backup files
-# Only active when DairyNet Version is >= 44
-backup.file-filter=*.zip
-# If true will compress the backup files additionally with the specified compression-type
-# Only active when DairyNet Version is >= 44
-backup.compress-backups=false
-# Either gz or zip
-backup.compression-type=gz
-# If true, will prefix the uploaded file with a timestamp of the files last modification
-backup.prefix-with-timestamp=true
-backup.creation-endpoint=/farmview/systemAdministration/requestBackup
-# Backup Edge-Storage configuration
-backup.storage.container=backup
-# If Edge-Storage should be used, or the file uploaded by requesting a SAS token
-backup.storage.use-edge-storage=false
+    @Primary
+    @Bean
+    public BlobServiceClient blobServiceClient(AzureCredential credential,
+                                               @Value("${storage.account.endpoint}") String storageAccountEndpoint) {
+        BlobServiceClientBuilder builder = new BlobServiceClientBuilder().endpoint(storageAccountEndpoint);
+        if (credential.defaultCredential != null) {
+            builder = builder.credential(credential.defaultCredential);
+        } else {
+            builder = builder.credential(credential.keyCredential);
+        }
+        return builder.buildClient();
+    }
 
-# AFS communication config
-afs.host=http://farmviewconnector:9002/v1.0/remote
-afs.default-active-time-in-seconds=900
+    @lombok.Value
+    public static class AzureCredential {
+        DefaultAzureCredential defaultCredential;
+        AzureNamedKeyCredential keyCredential;
+    }
+
+}
+package com.gea.ft.service.farmsiteconnector.config;
+
+import com.azure.core.credential.AzureNamedKeyCredential;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Profile;
+
+@Configuration
+@Profile("local | openapi | test")
+public class NoOpBlobServiceClientConfiguration {
+
+    @Bean
+    public BlobServiceClientConfiguration.AzureCredential defaultCredential(@Value("${spring.cloud.azure.storage.blob.account-name}") String accountName,
+                                                                            @Value("${spring.cloud.azure.storage.blob.account-key}") String accountKey) {
+        return new BlobServiceClientConfiguration.AzureCredential(null, new AzureNamedKeyCredential(accountName,
+                accountKey));
+    }
+}
+package com.gea.ft.service.farmsiteconnector.controller;
+
+import com.gea.ft.service.exception.ApiError;
+import com.gea.ft.service.exception.utils.LogApiError;
+import com.gea.ft.service.farmsiteconnector.dto.CountryDto;
+import com.gea.ft.service.farmsiteconnector.dto.LanguageDto;
+import com.gea.ft.service.farmsiteconnector.enums.Language;
+import com.gea.ft.service.farmsiteconnector.service.BlobService;
+import com.gea.ft.service.farmsiteconnector.service.DocumentService;
+
+import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.Parameter;
+import io.swagger.v3.oas.annotations.enums.ParameterIn;
+import io.swagger.v3.oas.annotations.media.Schema;
+import io.swagger.v3.oas.annotations.responses.ApiResponse;
+import lombok.RequiredArgsConstructor;
+import org.slf4j.event.Level;
+import org.springframework.core.io.InputStreamResource;
+import org.springframework.core.io.Resource;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
+import org.springframework.validation.annotation.Validated;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
+
+import jakarta.validation.ConstraintViolationException;
+import jakarta.validation.Valid;
+import jakarta.validation.constraints.Pattern;
+import java.io.InputStream;
+import java.util.List;
+import java.util.UUID;
+
+import static jakarta.validation.constraints.Pattern.Flag.CASE_INSENSITIVE;
+
+@RestController
+@RequestMapping(value = "${api.base-path}/documents/")
+@Validated
+@RequiredArgsConstructor
+public class DocumentController {
+
+    private static final String FV_TERMS_OF_USE = "fv-terms-of-use";
+    private static final String REMOTE_ACCESS_POLICY = "remote-access-policy";
+    private static final String TERMS_OF_SALES = "terms-of-sales";
+    private static final String SAM_MANUAL = "sam-manual";
+    private static final String SAM_TROUBLESHOOTING = "sam-troubleshooting";
+    private static final String DOC_REGEX = FV_TERMS_OF_USE + "|" + REMOTE_ACCESS_POLICY + "|" + TERMS_OF_SALES + "|" +
+            SAM_MANUAL + "|" + SAM_TROUBLESHOOTING;
+
+    private final BlobService blobService;
+    private final DocumentService documentService;
+
+    @GetMapping(path = "{documentType}/{language}", produces = MediaType.APPLICATION_OCTET_STREAM_VALUE)
+    @Operation(summary = "Get document")
+    @ApiResponse(responseCode = "200", description = "Returns the desired document")
+    @Parameter(in = ParameterIn.PATH, name = "documentType", schema = @Schema(type = "string", allowableValues = {FV_TERMS_OF_USE, REMOTE_ACCESS_POLICY, TERMS_OF_SALES, SAM_MANUAL, SAM_TROUBLESHOOTING}))
+    @Parameter(in = ParameterIn.PATH, name = "language", schema = @Schema(type = "string"))
+    public ResponseEntity<Resource> getDocument(@PathVariable("documentType") @Pattern(regexp = DOC_REGEX, flags = {CASE_INSENSITIVE}) String documentType,
+                                                @PathVariable("language") Language language) {
+
+        String path = "%s/%s.pdf".formatted(documentType.toLowerCase(), language.toString().toLowerCase());
+        InputStream file = blobService.download(path);
+        HttpHeaders headers = new HttpHeaders();
+        headers.add("Content-Disposition", "attachment; filename=%s.pdf".formatted(documentType.toLowerCase()));
+        return ResponseEntity.ok()
+                .headers(headers)
+                .contentType(MediaType.APPLICATION_OCTET_STREAM)
+                .body(new InputStreamResource(file));
+    }
+
+    @GetMapping(path = "{documentType}/{language}/pdf", produces = MediaType.APPLICATION_PDF_VALUE)
+    @Operation(summary = "Get document as a PDF")
+    @ApiResponse(responseCode = "200", description = "Returns the desired document")
+    @Parameter(in = ParameterIn.PATH, name = "documentType", schema = @Schema(type = "string", allowableValues = {FV_TERMS_OF_USE, REMOTE_ACCESS_POLICY, TERMS_OF_SALES, SAM_MANUAL, SAM_TROUBLESHOOTING}))
+    public ResponseEntity<Resource> getDocumentAsPdf(@PathVariable("documentType") @Pattern(regexp = DOC_REGEX, flags = {CASE_INSENSITIVE}) String documentType,
+                                                     @Valid @Parameter(name = "country") CountryDto country,
+                                                     @PathVariable("language") Language language) {
+        InputStream file = documentService.getDocument(documentType.toLowerCase(),
+                country.getCountry(),
+                language.toString().toLowerCase());
+        HttpHeaders headers = new HttpHeaders();
+        headers.add("Content-Disposition", "attachment; filename=%s.pdf".formatted(documentType.toLowerCase()));
+        return ResponseEntity.ok()
+                .headers(headers)
+                .contentType(MediaType.APPLICATION_PDF)
+                .body(new InputStreamResource(file));
+    }
+
+    @GetMapping(value = "{documentType}/languages", produces = MediaType.APPLICATION_JSON_VALUE)
+    @Operation(summary = "Get file list under the folder")
+    @ApiResponse(responseCode = "200", description = "Returns the file name list of the specified folder")
+    @Parameter(in = ParameterIn.PATH, name = "documentType", schema = @Schema(type = "string", allowableValues = {FV_TERMS_OF_USE, REMOTE_ACCESS_POLICY, TERMS_OF_SALES, SAM_MANUAL, SAM_TROUBLESHOOTING}))
+    public List<LanguageDto> getAvailableLanguagesForDocument(@PathVariable("documentType") @Pattern(regexp = DOC_REGEX, flags = {CASE_INSENSITIVE}) String documentType,
+                                                              @Valid @Parameter(name = "country") CountryDto country) {
+        return documentService.getAvailableLanguagesForDocument(documentType, country.getCountry())
+                .stream()
+                .map(LanguageDto::new)
+                .toList();
+    }
+
+    @ExceptionHandler(ConstraintViolationException.class)
+    @ResponseStatus(HttpStatus.NOT_FOUND)
+    @LogApiError(Level.WARN)
+    public ApiError handleConstraintViolationException(ConstraintViolationException e) {
+        if (exceptionMessageContains(e, "documentType")) {
+            // This error is thrown by the annotation when the document type is not valid
+            return new ApiError(UUID.randomUUID(), "Invalid document type");
+        } else {
+            throw e;
+        }
+    }
+
+    @ExceptionHandler(MethodArgumentTypeMismatchException.class)
+    @ResponseStatus(HttpStatus.NOT_FOUND)
+    @LogApiError(Level.WARN)
+    public ApiError handleMethodArgumentNotValidException(MethodArgumentTypeMismatchException e) {
+        if (exceptionMessageContains(e, "Language")) {
+            // This error is thrown by the annotation when the language is not valid
+            return new ApiError(UUID.randomUUID(), "Invalid language");
+        } else {
+            throw e;
+        }
+    }
+
+    private static boolean exceptionMessageContains(Exception e, String containText) {
+        String m = e.getMessage();
+        if (m == null) {
+            return false;
+        }
+        return m.contains(containText);
+    }
+}
+connector/last-connection-date/b51b82a4-3986-4748-b3c1-7169de458aed;client=10.74.59.11;user=32846f05-78f7-4df7-b934-cefc084f21c1","exceptionClass":"ItemNotFoundException","imageVersion":"d8da4a176e2707652f80c63bc2948005a549c75d"}
+{"timestamp":"2026-07-21T13:17:59.922503308Z","logger":"com.gea.ft.service.farmsiteconnector.service.mobileproxy.MobileProxyWhitelistService","level":"DEBUG","thread":"http-nio-8080-exec-6","mdc":{"trace_id":"9af07abba194ed6cc598a77a2d0e391d","trace_flags":"01","span_id":"b6426dddef675527"},"message":"Mobile proxy request matched whitelist entry with alias get.mobile: GET /mobile/basicdata","imageVersion":"d8da4a176e2707652f80c63bc2948005a549c75d"}
+{"timestamp":"2026-07-21T13:17:59.922615414Z","logger":"com.gea.ft.service.farmsiteconnector.service.mobileproxy.MobileProxyService","level":"DEBUG","thread":"http-nio-8080-exec-6","mdc":{"trace_id":"9af07abba194ed6cc598a77a2d0e391d","trace_flags":"01","span_id":"b6426dddef675527"},"message":"Proxying request: GET /mobile/basicdata","imageVersion":"d8da4a176e2707652f80c63bc2948005a549c75d"}
+{"timestamp":"2026-07-21T13:17:59.977654392Z","logger":"com.azure.identity.ChainedTokenCredential","level":"INFO","thread":"http-nio-8080-exec-6","mdc":{"trace_id":"9af07abba194ed6cc598a77a2d0e391d","trace_flags":"00","span_id":"663e4a4a296d2db3"},"message":"Azure Identity => Attempted credential EnvironmentCredential is unavailable.","imageVersion":"d8da4a176e2707652f80c63bc2948005a549c75d"}
+{"timestamp":"2026-07-21T13:18:00.131812875Z","logger":"com.azure.identity.ChainedTokenCredential","level":"INFO","thread":"http-nio-8080-exec-6","mdc":{"trace_id":"9af07abba194ed6cc598a77a2d0e391d","trace_flags":"00","span_id":"663e4a4a296d2db3"},"message":"Azure Identity => Attempted credential WorkloadIdentityCredential returns a token","imageVersion":"d8da4a176e2707652f80c63bc2948005a549c75d"}
+{"timestamp":"2026-07-21T13:18:00.236480959Z","logger":"com.gea.ft.service.exception.utils.LogApiErrorHandler","level":"WARN","thread":"http-nio-8080-exec-6","mdc":{"trace_id":"9af07abba194ed6cc598a77a2d0e391d","trace_flags":"01","span_id":"b6426dddef675527"},"stackTrace":"com.azure.storage.blob.models.BlobStorageException: If you are using a StorageSharedKeyCredential, and the server returned an error message that says 'Signature did not match', you can compare the string to sign with the one generated by the SDK. To log the string to sign, pass in the context key value pair 'Azure-Storage-Log-String-To-Sign': true to the appropriate method call.\nIf you are using a SAS token, and the server returned an error message that says 'Signature did not match', you can compare the string to sign with the one generated by the SDK. To log the string to sign, pass in the context key value pair 'Azure-Storage-Log-String-To-Sign': true to the appropriate generateSas method call.\nPlease remember to disable 'Azure-Storage-Log-String-To-Sign' before going to production as this string can potentially contain PII.\nIf you are using a StorageSharedKeyCredential, and the server returned an error message that says 'Signature did not match', you can compare the string to sign with the one generated by the SDK. To log the string to sign, pass in the context key value pair 'Azure-Storage-Log-String-To-Sign': true to the appropriate method call.\nIf you are using a SAS token, and the server returned an error message that says 'Signature did not match', you can compare the string to sign with the one generated by the SDK. To log the string to sign, pass in the context key value pair 'Azure-Storage-Log-String-To-Sign': true to the appropriate generateSas method call.\nPlease remember to disable 'Azure-Storage-Log-String-To-Sign' before going to production as this string can potentially contain PII.\nStatus code 403, \"﻿<?xml version=\"1.0\" encoding=\"utf-8\"?><Error><Code>AuthorizationPermissionMismatch</Code><Message>This request is not authorized to perform this operation using this permission.\nRequestId:db271b73-e01e-0029-5d13-193963000000\nTime:2026-07-21T13:18:00.1823473Z</Message></Error>\"\n\tat com.azure.storage.blob.implementation.util.ModelHelper.mapToBlobStorageException(ModelHelper.java:660)\n\tat com.azure.storage.blob.implementation.ServicesImpl.getUserDelegationKeyWithResponse(ServicesImpl.java:1969)\n\tat com.azure.storage.blob.BlobServiceClient.lambda$getUserDelegationKeyWithResponse$8(BlobServiceClient.java:798)\n\tat com.azure.storage.common.implementation.StorageImplUtils.sendRequest(StorageImplUtils.java:494)\n\tat com.azure.storage.blob.BlobServiceClient.getUserDelegationKeyWithResponse(BlobServiceClient.java:803)\n\tat com.azure.storage.blob.BlobServiceClient.getUserDelegationKey(BlobServiceClient.java:764)\n\tat com.gea.ft.lib.cloud.directmethod.service.sas.IdentityBasedSasGenerator.generateSas(IdentityBasedSasGenerator.java:23)\n\tat com.gea.ft.lib.cloud.directmethod.service.CloudDirectMethodBlobService.generateSas(CloudDirectMethodBlobService.java:76)\n\tat com.gea.ft.lib.cloud.directmethod.service.CloudDirectMethodBlobService.generateSasForBlobUpload(CloudDirectMethodBlobService.java:69)\n\tat com.gea.ft.lib.cloud.directmethod.service.CloudDirectMethodMessageHelper.buildMessageRequestEnvelope(CloudDirectMethodMessageHelper.java:43)\n\tat com.gea.ft.lib.cloud.directmethod.service.DirectMethodService.invokeCustomModule(DirectMethodService.java:61)\n\tat com.gea.ft.service.farmsiteconnector.service.mobileproxy.MobileProxyDirectMethodService.sendRequestToDevice(MobileProxyDirectMethodService.java:34)\n\t... 165 common frames omitted\nWrapped by: com.gea.ft.service.farmsiteconnector.exception.IoTHubCommunicationException: com.azure.storage.blob.models.BlobStorageException: If you are using a StorageSharedKeyCredential, and the server returned an error message that says 'Signature did not match', you can compare the string to sign with the one generated by the SDK. To log the string to sign, pass in the context key value pair 'Azure-Storage-Log-String-To-Sign': true to the appropriate method call.\nIf you are using a SAS token, and the server returned an error message that says 'Signature did not match', you can compare the string to sign with the one generated by the SDK. To log the string to sign, pass in the context key value pair 'Azure-Storage-Log-String-To-Sign': true to the appropriate generateSas method call.\nPlease remember to disable 'Azure-Storage-Log-String-To-Sign' before going to production as this string can potentially contain PII.\nIf you are using a StorageSharedKeyCredential, and the server returned an error message that says 'Signature did not match', you can compare the string to sign with the one generated by the SDK. To log the string to sign, pass in the context key value pair 'Azure-Storage-Log-String-To-Sign': true to the appropriate method call.\nIf you are using a SAS token, and the server returned an error message that says 'Signature did not match', you can compare the string to sign with the one generated by the SDK. To log the string to sign, pass in the context key value pair 'Azure-Storage-Log-String-To-Sign': true to the appropriate generateSas method call.\nPlease remember to disable 'Azure-Storage-Log-String-To-Sign' before going to production as this string can potentially contain PII.\nStatus code 403, \"﻿<?xml version=\"1.0\" encoding=\"utf-8\"?><Error><Code>AuthorizationPermissionMismatch</Code><Message>This request is not authorized to perform this operation using this permission.\nRequestId:db271b73-e01e-0029-5d13-193963000000\nTime:2026-07-21T13:18:00.1823473Z</Message></Error>\"\n\tat com.gea.ft.service.farmsiteconnector.service.mobileproxy.MobileProxyDirectMethodService.sendRequestToDevice(MobileProxyDirectMethodService.java:43)\n\tat com.gea.ft.service.farmsiteconnector.service.mobileproxy.MobileProxyService.proxyCall(MobileProxyService.java:65)\n\tat com.gea.ft.service.farmsiteconnector.controller.v1.MobileProxyV1Controller.proxy(MobileProxyV1Controller.java:53)\n\tat jdk.internal.reflect.DirectMethodHandleAccessor.invoke(Unknown Source)\n\tat java.lang.reflect.Method.invoke(Unknown Source)\n\tat org.springframework.aop.support.AopUtils.invokeJoinpointUsingReflection(AopUtils.java:360)\n\tat org.springframework.aop.framework.ReflectiveMethodInvocation.invokeJoinpoint(ReflectiveMethodInvocation.java:196)\n\tat org.springframework.aop.framework.ReflectiveMethodInvocation.proceed(ReflectiveMethodInvocation.java:163)\n\tat org.springframework.aop.aspectj.MethodInvocationProceedingJoinPoint.proceed(MethodInvocationProceedingJoinPoint.java:89)\n\tat com.gea.ft.service.authorization.evaluation.utils.AuthorizationCheck.checkAuthorization(AuthorizationCheck.java:45)\n\tat jdk.internal.reflect.DirectMethodHandleAccessor.invoke(Unknown Source)\n\tat java.lang.reflect.Method.invoke(Unknown Source)\n\tat org.springframework.aop.aspectj.AbstractAspectJAdvice.invokeAdviceMethodWithGivenArgs(AbstractAspectJAdvice.java:649)\n\tat org.springframework.aop.aspectj.AbstractAspectJAdvice.invokeAdviceMethod(AbstractAspectJAdvice.java:631)\n\tat org.springframework.aop.aspectj.AspectJAroundAdvice.invoke(AspectJAroundAdvice.java:71)\n\tat org.springframework.aop.framework.ReflectiveMethodInvocation.proceed(ReflectiveMethodInvocation.java:173)\n\tat org.springframework.aop.interceptor.ExposeInvocationInterceptor.invoke(ExposeInvocationInterceptor.java:97)\n\tat org.springframework.aop.framework.ReflectiveMethodInvocation.proceed(ReflectiveMethodInvocation.java:184)\n\tat org.springframework.aop.framework.CglibAopProxy$DynamicAdvisedInterceptor.intercept(CglibAopProxy.java:728)\n\tat 
 
 
-#Do not change this value in this file: Could expose PII
-#Enables request body logging for Api error logs
-log.api-error.request-body=false
-# Loggers (classes or packages) and exception-classes to downgrade from ERROR to WARN during runtime
-log.runtime.downgrade-loggers=\
-  com.azure.core.amqp.implementation.RetryUtil,\
-  com.azure.core.http.netty.NettyAsyncHttpClient,\
-  com.azure.messaging.servicebus.ServiceBusReceiverAsyncClient,\
-  io.r2dbc.postgresql.client.ReactorNettyClient
-log.runtime.downgrade-exceptions=
-# Loggers (classes or packages) and exception-classes to downgrade from ERROR to WARN during shutdown
-log.shutdown.downgrade-loggers=\
-  com.azure.core.amqp.implementation.RetryUtil,\
-  com.azure.identity.implementation.IdentityClient,\
-  com.azure.identity.implementation.PowershellManager
-log.shutdown.downgrade-exceptions=\
-  java.util.concurrent.RejectedExecutionException,\
-  org.springframework.core.task.TaskRejectedException,\
-  reactor.netty.http.client.PrematureCloseException
-
-mqtt.enabled=true
-mqtt.host=host.docker.internal
-mqtt.port=1883
-mqtt.subscribed-topics=gea/par/+/sysSt,gea/sys/farm/ct/cfg,gea/app/dnc/#
-
-dataexplorer.retrieval-endpoint=/dairynet-cloud/analytics/cms
-dataexplorer.username=dairynetcloud
-dataexplorer.password=DAIRYNETCLOUD
-dataexplorer.transmit-as-avro=true
-
-# Rate limiting for MQTT messages
-# The topics to buffer messages for e.g. gea/par/bufferMe1/sysSt,gea/par/bufferMe2/sysSt
-rate-limit.mqtt.buffer.topics=
-rate-limit.mqtt.buffer.size=1000
-rate-limit.mqtt.refill-interval=10s
-rate-limit.mqtt.refill-tokens=10
-rate-limit.mqtt.max-capacity=60
-
-# Rate limiting for general messages
-rate-limit.message.refill-interval=10s
-rate-limit.message.refill-tokens=10
-rate-limit.message.max-capacity=60
-
-# These variables should be set automatically by the IoT Edge runtime when running the container on an edge device
-iot-edge.device-id=
-iot-edge.iot-hub-host-name=
-iot-edge.module-id=
-iot-edge.workload-uri=
-
-directmethod-lib.use-managed-identity=false
-directmethod-lib.use-on-iot-device=true
-directmethod-lib.max-payload-size=100000
-
-edgehub.metrics-url=http://edgehub:9600/metrics
-edgehub.check-interval=30s
-
-failed-messages-cleanup.cron-expression=0 0 0 * * *
-dairynet-data-retrieval.cron-expression=0 59 * * * *
-dairy-net-version-check.cron-expression=0 0 0 * * *
-dairy-net-velos-version.cron-expression=0 0 0 * * *
-token-information-cleanup.cron-expression=0 0 0 * * *
-
-event-trail.cleanup.max-age=P365D
-
-user-information.cache-time=P1D
-farm-site-connector-service.endpoint=https://dairynet.dev.gea.com
-remote-access-service.endpoint=${farm-site-connector-service.endpoint}
-
-jwt.issuer-uri=https://login.portal.tst.gea.com/f5e22871-4b99-495e-affa-77a8b33a6686/v2.0/
-jwt.jwk-set-uri=https://login.portal.tst.gea.com/geaidtst.onmicrosoft.com/b2c_1_signin_signup/discovery/v2.0/keys
-spring.security.oauth2.resourceserver.jwt.issuer-uri=${jwt.issuer-uri}
-spring.security.oauth2.resourceserver.jwt.jwk-set-uri=${jwt.jwk-set-uri}
-
-# RabbitMQ Shovel config
-rabbitmq.shovel-config.enabled=false
-rabbitmq.shovel-config.verify-peer=true
-rabbitmq.shovel-config.dairynet.host=http://host.docker.internal:15672
-rabbitmq.shovel-config.dairynet.username=dairynet
-rabbitmq.shovel-config.dairynet.password=dairynet
-rabbitmq.shovel-config.dairynet.vhost=/
-rabbitmq.shovel-config.dairynet.to-cloud-queue=dairynet.to.cloud
-rabbitmq.shovel-config.dairynet.from-cloud-queue=cloud.to.dairynet
-
-# Graceful shutdown configuration
-server.shutdown=graceful
-# Amount of time to wait for active requests to complete
-spring.lifecycle.timeout-per-shutdown-phase=20s
-# Grafana Alloy credentials endpoint
-app.grafana.credentials-path-prefix=/grafana
-app.grafana.loki-url=https://dnb-loki.dairynet.dev.gea.com/loki/api/v1/push
-
-# grafana token refresh in minutes
-app.dnc-token.expiry-time=15
-app.dnc-token.refresh-fraction=0.5
-# Fraction of a token's *remaining* lifetime to wait before sending a follow-up request.
-# E.g. 0.5 with a 60-min token at 50% elapsed (30 min remaining) -> wait 15 min, retry at 75%
-# A successful token-update response resets this cooldown immediately.
-app.dnc-token.cooldown-fraction=0.5
-
-dairy-net-data.cleanup-on-startup=true
-
-# EDS Data Forwarding (FTDP-5898)
-eds.mqtt-enabled=true
-eds.rollover-minutes=60
-eds.rollover-max-megabytes=200
-eds.stash-retention-days=3
-eds.storage-dir=./eds
-eds.data-forwarding-base-url=${farm-site-connector-service.endpoint}
-eds.upload-path=/api/dataforwarding/upload/eds
 
 
     a
